@@ -4,7 +4,7 @@ sentence-transformers==2.2.2
 chromadb==0.4.15
 python-dotenv==1.0.0
 requests==2.31.0
-torch>=2.1.0
+torch==2.1.2
 numpy==1.24.3
 huggingface_hub==0.15.1
 faiss-cpu==1.7.4

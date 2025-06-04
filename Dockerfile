@@ -22,7 +22,7 @@ COPY . .
 RUN mkdir -p /app/data
 
 # Set environment variables
-ENV FLASK_APP=simple_bot.py
+ENV FLASK_APP=app.py
 ENV FLASK_ENV=production
 
 # Expose port
@@ -33,4 +33,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3000/health || exit 1
 
 # Run the application
-CMD ["python", "local.py"]
+CMD ["python", "app.py"]

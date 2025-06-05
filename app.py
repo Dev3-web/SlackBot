@@ -13,7 +13,7 @@ import faiss
 import pickle
 from typing import List, Dict, Optional
 import openai
-from transformers import pipeline
+# from transformers import pipeline # REMOVED: No more local Hugging Face models
 import google.generativeai as genai
 from pymongo.errors import PyMongoError
 import gridfs
@@ -29,9 +29,6 @@ app = Flask(__name__)
 app.logger.setLevel(logging.INFO)
 
 # Configure Gemini API Key
-# IMPORTANT: It's best practice to load this from .env directly, not hardcode a placeholder.
-# If you hardcode it here (even a placeholder), it will override the .env value.
-# I'm reverting to load from .env first, with a placeholder fallback if missing.
 GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")
 if not GEMINI_API_KEY:
     GEMINI_API_KEY = "YOUR_GOOGLE_API_KEY_HERE" # Placeholder for missing key
@@ -51,7 +48,7 @@ if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GOOGLE_API_KEY_HERE":
         app.logger.critical(f"Failed to configure Gemini API: {e}. Please check your key.")
 else:
     app.logger.error(
-        "CRITICAL: Gemini API Key is not configured. The application will likely fail to get embeddings."
+        "CRITICAL: Gemini API Key is not configured. The application will likely fail to get embeddings and generate responses."
     )
 
 # Initialize Flask app
@@ -79,6 +76,23 @@ else:
 
 class EnhancedRAGKnowledgeBase:
     def __init__(self):
+        # Initialize attributes with default/safe values first
+        self.mongodb_connected = False
+        self.mongo_client = None
+        self.db = None
+        self.documents_collection = None
+        self.chunks_collection = None
+        self.gridfs = None
+        self.gemini_embedding_model_id = "models/text-embedding-004"
+        self.gemini_generation_model_id = "gemini-pro"
+        self.model_name = self.gemini_embedding_model_id # Set here too
+        self.embedding_dim = 768
+        self.index = faiss.IndexFlatIP(self.embedding_dim)
+        self.doc_ids = []
+        self.doc_texts = []
+        self.doc_metadatas = []
+        self.gemini_generation_available = False
+
         # MongoDB setup
         try:
             self.mongo_client = MongoClient(MONGODB_URI)
@@ -100,47 +114,34 @@ class EnhancedRAGKnowledgeBase:
         except Exception as e:
             app.logger.error(f"❌ Failed to connect to MongoDB at {MONGODB_URI}: {e}")
             self.mongodb_connected = False
-            # We don't raise here, but mark connection as failed
-            # This allows the app to start even without DB, but functionalities will be limited.
-
-        # Gemini configuration
-        self.gemini_embedding_model_id = "models/text-embedding-004"
-        self.model_name = self.gemini_embedding_model_id
-        self.embedding_dim = 768 # Standard for text-embedding-004
+            # Exit early if MongoDB connection is critical for your app to function.
+            # Otherwise, allow it to continue but mark as not connected.
+            # raise # Uncomment this if you want the app to crash if DB isn't available
 
         app.logger.info(
-            f"Initializing RAG with Gemini model: {self.gemini_embedding_model_id} (Dimension: {self.embedding_dim})"
+            f"Initializing RAG with Gemini models: Embedding='{self.gemini_embedding_model_id}' (Dim: {self.embedding_dim}), Generation='{self.gemini_generation_model_id}'"
         )
 
-        # FAISS setup
-        self.index = faiss.IndexFlatIP(self.embedding_dim)
-        self.doc_ids = [] # Stores chunk_ids
-        self.doc_texts = [] # Stores chunk_texts
-        self.doc_metadatas = [] # Stores parent document metadata for each chunk
+        # QA Pipeline setup (Now uses Gemini for generation instead of a local model)
+        if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GOOGLE_API_KEY_HERE":
+            try:
+                # Test if gemini-pro is accessible
+                genai.GenerativeModel(self.gemini_generation_model_id).generate_content("test", stream=True).resolve()
+                self.gemini_generation_available = True
+                app.logger.info(f"Gemini generation model '{self.gemini_generation_model_id}' is available.")
+            except Exception as e:
+                app.logger.warning(f"Gemini generation model '{self.gemini_generation_model_id}' not available. Error: {e}. Answers will use only retrieved context.")
+        else:
+            app.logger.warning("Gemini API key not configured for generation. Answers will use only retrieved context.")
 
-        # QA Pipeline setup
-        try:
-            # Check if a model is specified in env or use default
-            qa_model_name = os.environ.get("QA_MODEL", "distilbert-base-cased-distilled-squad")
-            self.qa_pipeline = pipeline(
-                "question-answering", model=qa_model_name
-            )
-            app.logger.info(
-                f"QA pipeline '{qa_model_name}' loaded successfully."
-            )
-        except Exception as e:
-            self.qa_pipeline = None
-            app.logger.warning(
-                f"QA pipeline not loaded. Error: {e}. QA features will be limited."
-            )
 
         # Only attempt to load embeddings if MongoDB is connected and Gemini API key is set
         if self.mongodb_connected and GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GOOGLE_API_KEY_HERE":
             self.load_existing_embeddings()
         elif not self.mongodb_connected:
-            app.logger.warning("Skipping load_existing_embeddings: MongoDB connection failed.")
+            app.logger.warning("Skipping load_existing_embeddings: MongoDB connection failed (from __init__).")
         else:
-            app.logger.warning("Skipping load_existing_embeddings: Gemini API key not configured.")
+            app.logger.warning("Skipping load_existing_embeddings: Gemini API key not configured (from __init__).")
 
 
     def chunk_text(self, text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
@@ -200,6 +201,7 @@ class EnhancedRAGKnowledgeBase:
         try:
             # Gemini has a 3072 token limit for embed_content.
             # Truncate if necessary, though chunking should handle most cases.
+            # For robust production, consider tokenizers to accurately count tokens
             if len(text) > 2048: # Rough estimate, actual token count can vary
                 text = text[:2048] 
                 app.logger.warning("Truncated text for embedding due to length.")
@@ -458,28 +460,8 @@ class EnhancedRAGKnowledgeBase:
             if not query_words:
                 return {"documents": [], "scores": [], "metadatas": [], "ids": []}
 
-            # Build regex for each word to ensure full word matching if possible
-            # Or use $text search if full text index is enabled on 'text' field in 'documents'
-            # For simplicity, using $or with regex for now, which is less efficient than $text index.
-            # To use $text, ensure you have a text index on your 'text' field in 'documents' collection:
-            # db.documents.createIndex({"text": "text"})
-
-            # Let's do a simple phrase search if possible, then fallback to word search
             regex_query = "(?i)" + "|".join(re.escape(word) for word in query_words)
             
-            # Find documents containing any of the query words.
-            # Fetch entire documents and then score them. This is less efficient than if chunks
-            # were indexed for keyword search directly, but fits the current model.
-            
-            # Using $text search requires a text index: db.documents.createIndex({"text": "text"})
-            # If you don't have a text index, comment out the $text search part.
-            # Example using $text:
-            # documents = list(self.documents_collection.find(
-            #     {"$text": {"$search": query}}, 
-            #     {"score": {"$meta": "textScore"}}
-            # ).sort([("score", {"$meta": "textScore"})]).limit(n_results * 5)) # Fetch more for scoring
-
-            # Fallback to regex search on document text if $text not used or desired
             documents_from_db = list(self.documents_collection.find(
                 {"text": {"$regex": regex_query, "$options": "i"}}
             ).limit(n_results * 5)) # Fetch more than n_results to allow for internal scoring
@@ -492,13 +474,11 @@ class EnhancedRAGKnowledgeBase:
                 text_words = set(re.findall(r"\w+", doc["text"].lower()))
                 common_words = query_words.intersection(text_words)
                 
-                # Simple keyword score based on Jaccard index
                 score = 0
                 if query_words.union(text_words): # Avoid division by zero
                     score = len(common_words) / len(query_words.union(text_words))
                 
                 if score > 0: # Only add if there's a match
-                    # For keyword search, we return the full document text, not just chunks
                     scored_docs.append((score, doc["text"], doc["metadata"], doc["doc_id"]))
 
             scored_docs.sort(reverse=True, key=lambda x: x[0])
@@ -517,28 +497,40 @@ class EnhancedRAGKnowledgeBase:
             app.logger.error(f"Error in keyword search: {e}")
             return {"documents": [], "scores": [], "metadatas": [], "ids": []}
 
-    def generate_answer_with_qa_model(self, question: str, context: str) -> str:
-        if not self.qa_pipeline:
+    # MODIFIED: Now uses Gemini for generation instead of a local QA model
+    def generate_answer_with_llm(self, question: str, context: str) -> str:
+        if not self.gemini_generation_available:
+            app.logger.warning("Gemini generation model not available. Returning raw context.")
             return context[:500] + "..." if len(context) > 500 else context
+        
         try:
-            # The QA model has a context limit. Truncate context if too long.
-            # distilbert-base-cased-distilled-squad has a max sequence length of 384
-            # We'll use a larger buffer for safety.
-            max_context_len = 500 # Characters, not tokens, as a rough measure
-            if len(context) > max_context_len:
-                context = context[:max_context_len]
+            model = genai.GenerativeModel(self.gemini_generation_model_id)
+            
+            # Craft a prompt for Gemini for RAG
+            prompt = (
+                f"You are an AI assistant. Answer the following question based only on the provided context. "
+                f"If the answer cannot be found in the context, respond with 'I couldn't find a direct answer based on the provided information.'"
+                f"\n\nContext:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+            )
+            
+            # Gemini has token limits for prompts. Adjust context if needed.
+            # Max input for gemini-pro is 30720 tokens. We'll use a conservative char limit.
+            if len(prompt) > 20000: # Very rough estimate, actual token count will vary
+                app.logger.warning("Prompt too long for Gemini, truncating context.")
+                # This could be more intelligent, e.g., using a tokenizer to get token count
+                context = context[:(20000 - len(question) - 100)] # Leave space for question and prompt text
+                prompt = (
+                    f"You are an AI assistant. Answer the following question based only on the provided context. "
+                    f"If the answer cannot be found in the context, respond with 'I couldn't find a direct answer based on the provided information.'"
+                    f"\n\nContext:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+                )
 
-            result = self.qa_pipeline(question=question, context=context)
-            answer, confidence = result["answer"], result["score"]
-            
-            # Confidence threshold and answer length heuristic
-            if confidence < 0.2 or len(answer) < 10: # Increased confidence threshold slightly
-                app.logger.info(f"QA model confidence ({confidence:.2f}) or answer length low ({len(answer)}). Fallback to context.")
-                return context[:500] + "..." if len(context) > 500 else context
-            
-            return answer
+
+            response = model.generate_content(prompt)
+            # Access response.text directly to get the generated string
+            return response.text
         except Exception as e:
-            app.logger.error(f"Error in QA generation: {e}")
+            app.logger.error(f"Error generating answer with Gemini LLM: {e}")
             return context[:500] + "..." if len(context) > 500 else context
 
     def search(self, query: str, n_results: int = 3, use_hybrid: bool = True) -> Dict:
@@ -552,7 +544,7 @@ class EnhancedRAGKnowledgeBase:
     def get_all_documents(self):
         if not self.mongodb_connected:
             app.logger.error("Cannot get all documents: MongoDB is not connected.")
-            return {"ids": [], "documents": [], "metadatas": []}
+            return {"ids": [], "documents": [], "metadatas": [], "total_documents": 0} # Return total_documents
             
         try:
             # Fetch all documents, but only return necessary fields for summary
@@ -561,13 +553,14 @@ class EnhancedRAGKnowledgeBase:
                 "ids": [doc["doc_id"] for doc in documents],
                 "documents": [doc["text"] for doc in documents],
                 "metadatas": [doc["metadata"] for doc in documents],
+                "total_documents": len(documents) # Added for clarity
             }
         except PyMongoError as e:
             app.logger.error(f"MongoDB error getting all documents: {e}")
-            return {"ids": [], "documents": [], "metadatas": []}
+            return {"ids": [], "documents": [], "metadatas": [], "total_documents": 0}
         except Exception as e:
             app.logger.error(f"Error getting all documents: {e}")
-            return {"ids": [], "documents": [], "metadatas": []}
+            return {"ids": [], "documents": [], "metadatas": [], "total_documents": 0}
 
     def delete_document(self, doc_id: str) -> bool:
         """Delete a document and its chunks from MongoDB."""
@@ -639,13 +632,13 @@ def extract_text_from_pdf(pdf_file) -> str:
 def get_time_based_greeting():
     current_hour = datetime.now().hour
     if 5 <= current_hour < 12:
-        return random.choice(["Good morning! ☀️", "Morning! 🌅"])
+        return random.choice(["Good morning!", "Morning!"])
     elif 12 <= current_hour < 17:
-        return random.choice(["Good afternoon! ☀️", "Afternoon! 👋"])
+        return random.choice(["Good afternoon!", "Afternoon!"])
     elif 17 <= current_hour < 21:
-        return random.choice(["Good evening! 🌆", "Evening! 👋"])
+        return random.choice(["Good evening!", "Evening!"])
     else:
-        return random.choice(["Hello! Working late? 🌙", "Hi there! 👋"])
+        return random.choice(["Hello!", "Hi there!"])
 
 
 def detect_greeting(text):
@@ -666,23 +659,26 @@ def detect_greeting(text):
         "evening",
         "yo",
         "hola",
+        # Added phrases that might imply a request for help/action, leading to "How may I assist you?"
+        "what can you do", 
+        "how can you help",
+        "how are you",
+        "how's it going",
+        "can you help",
+        "need help",
+        "assist me"
     ]
-    for greeting in greetings:
-        if text_lower.startswith(greeting):
+    # Check if any greeting phrase is present in the text
+    for greeting_phrase in greetings:
+        if greeting_phrase in text_lower:
             return True
-    if any(p in text_lower for p in ["how are you", "how's it going"]):
-        return True
     return False
 
 
 def generate_greeting_response():
     time_greeting = get_time_based_greeting()
-    follow_ups = [
-        "How can I help you today?",
-        "What can I assist you with?",
-        "Ready to help! What do you need?",
-    ]
-    return f"{time_greeting} {random.choice(follow_ups)} 😊"
+    # Specifically generate the desired response
+    return f"{time_greeting} How may I assist you? 😊"
 
 
 def detect_thanks(text):
@@ -717,43 +713,43 @@ def generate_thanks_response():
     ]
     return random.choice(responses)
 
+# REMOVED: This function is no longer needed as its intent is covered by detect_greeting
+# def detect_help_request(text):
+#     text_lower = text.lower().strip()
+#     help_phrases = [
+#         "help",
+#         "what can you do",
+#         "how can you help",
+#         "capabilities",
+#         "assistance",
+#         "guide me",
+#     ]
+#     if any(phrase in text_lower for phrase in help_phrases):
+#         return True
+#     return False
 
-def detect_help_request(text):
-    text_lower = text.lower().strip()
-    help_phrases = [
-        "help",
-        "what can you do",
-        "how can you help",
-        "capabilities",
-        "assistance",
-        "guide me",
-    ]
-    if any(phrase in text_lower for phrase in help_phrases):
-        return True
-    return False
-
-
-def generate_help_response():
-    return (
-        f"I'm an AI assistant using RAG with Gemini embeddings ({kb.model_name}) 🤖. "
-        "I can answer questions based on my knowledge base about support, billing, passwords, or product features. Ask me anything!"
-    )
+# REMOVED: This function is no longer needed as its intent is covered by generate_greeting_response
+# def generate_help_response():
+#     return (
+#         f"I'm an AI assistant using RAG with Gemini embeddings ({kb.model_name}) 🤖. "
+#         "I can answer questions based on my knowledge base about support, billing, passwords, or product features. Ask me anything!"
+#     )
 
 
 def enhanced_generate_response(
     question: str,
     context_docs: List[str],
     scores: List[float] = None,
-    doc_ids: List[str] = None,
 ) -> str:
     question_lower = question.lower().strip()
 
-    if detect_greeting(question_lower):
+    if detect_greeting(question_lower): # This now handles all "greeting-like" initial contacts
         return generate_greeting_response()
     if detect_thanks(question_lower):
         return generate_thanks_response()
-    if detect_help_request(question_lower):
-        return generate_help_response()
+    # REMOVED: No longer need this separate check as it's part of detect_greeting
+    # if detect_help_request(question_lower):
+    #     return generate_help_response()
 
     farewell_words = [
         "bye",
@@ -779,25 +775,32 @@ def enhanced_generate_response(
         "🎯" if confidence_score > 0.7 else "📈" if confidence_score > 0.55 else "💡"
     )
 
-    if kb.qa_pipeline and best_context and len(best_context.strip()) > 20:
-        generated_answer = kb.generate_answer_with_qa_model(question, best_context)
-        # Check if QA model returned something different from truncated context and is meaningful
-        is_qa_meaningful = (
-            generated_answer
-            != (best_context[:500] + "..." if len(best_context) > 500 else best_context)
-            and len(generated_answer) >= 15
-        )
-        if is_qa_meaningful:
-            return (
+    # Use generate_answer_with_llm (Gemini)
+    if kb.gemini_generation_available and best_context and len(best_context.strip()) > 20:
+        generated_answer = kb.generate_answer_with_llm(question, best_context)
+        # Check if the LLM provided a meaningful answer
+        if generated_answer and generated_answer.strip().lower() not in ["i couldn't find a direct answer based on the provided information.", ""]:
+             return (
                 f"{confidence_emoji} Here's what I found:\n\n_{generated_answer}_\n\n"
                 f"Is this helpful? (Source relevance: {confidence_score:.2f})"
             )
+        else:
+            # Fallback to just providing the context if LLM couldn't answer or gave a default response
+            app.logger.info("Gemini LLM couldn't generate a specific answer or returned a default response. Falling back to context.")
+            response_text = best_context
+            if len(response_text) > 700:
+                response_text = response_text[:700] + "..."
+            return (
+                f"{confidence_emoji} Based on my knowledge, here's some information:\n\n{response_text}\n\n"
+                f"Is this helpful? (Relevance: {confidence_score:.2f})"
+            )
 
+    # Final fallback if no LLM or context too short
     response_text = best_context
     if len(response_text) > 700:
         response_text = response_text[:700] + "..."
     return (
-        f"{confidence_emoji}here's some information:\n\n{response_text}\n\n"
+        f"{confidence_emoji}Here's some information:\n\n{response_text}\n\n" 
         f"Is this helpful?"
     )
 
@@ -819,16 +822,16 @@ def handle_message(event):
         app.logger.info(f"Processing question from channel {channel}: '{text}'")
 
         # Check for conversational cues first
+        # This now handles all "greeting-like" initial contacts, and will trigger "How may I assist you?"
         if (
             detect_greeting(text)
             or detect_thanks(text)
-            or detect_help_request(text)
             or any(
                 word in text.lower().strip()
                 for word in ["bye", "goodbye", "good night"]
             )
         ):
-            response = enhanced_generate_response(text, [], None, None)
+            response = enhanced_generate_response(text, [], None) # Pass None for scores/doc_ids as they are not relevant here
         else:
             # Ensure KB is ready before performing search
             if not kb.mongodb_connected or not (GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GOOGLE_API_KEY_HERE"):
@@ -837,14 +840,14 @@ def handle_message(event):
                 search_results = kb.search(text, n_results=3, use_hybrid=True)
                 context_docs = search_results.get("documents", [])
                 scores = search_results.get("scores")
-                doc_ids = search_results.get("ids") # Pass along if needed by response fn
+                # doc_ids = search_results.get("ids") # Not directly used by enhanced_generate_response, can remove
                 if context_docs:
                     app.logger.info(
                         f"Found {len(context_docs)} relevant chunks. Top score: {scores[0] if scores else 'N/A'}"
                     )
                 else:
                     app.logger.info(f"No relevant documents found for query: '{text}'")
-                response = enhanced_generate_response(text, context_docs, scores, doc_ids)
+                response = enhanced_generate_response(text, context_docs, scores)
 
         if SLACK_BOT_TOKEN: # Ensure token is available before trying to post
             slack_client.chat_postMessage(
@@ -872,7 +875,6 @@ def handle_message(event):
 
 
 # --- Flask Routes ---
-# IMPORTANT: Only ONE @app.route("/slack/events") definition allowed!
 @app.route("/slack/events", methods=["POST"]) 
 def slack_events_route(): # Renamed to avoid confusion with the handler function
     data = request.json
@@ -1080,7 +1082,7 @@ def list_knowledge():
         docs_summary = kb.get_all_documents()
         return jsonify(
             {
-                "total_documents": len(docs_summary["ids"]),
+                "total_documents": docs_summary["total_documents"], # Use the new total_documents field
                 "embedding_model": kb.model_name,
                 "vector_dimension": kb.embedding_dim,
                 "total_chunks_in_faiss": kb.index.ntotal if kb.index else 0,
@@ -1125,12 +1127,13 @@ def health_check():
         "rag_enabled": is_mongodb_connected and gemini_configured,
         "database_type": "MongoDB",
         "database_name": MONGODB_DB_NAME,
-        "embedding_model": kb.model_name,
-        "vector_dimension": kb.embedding_dim,
+        "embedding_model": kb.model_name, # Access safely, though initialized in __init__
+        "vector_dimension": kb.embedding_dim, # Access safely
         "total_documents_in_db": db_stats.get("total_documents", 0),
         "total_chunks_in_db": db_stats.get("total_chunks", 0),
         "total_chunks_in_faiss": kb.index.ntotal if kb.index else 0,
-        "qa_model_loaded": kb.qa_pipeline is not None,
+        "qa_model_loaded": False, # Explicitly False as local models are removed
+        "gemini_generation_available": kb.gemini_generation_available, # New status for Gemini generation
         "gemini_api_configured": gemini_configured,
         "mongodb_connected": is_mongodb_connected,
         "slack_bot_token_configured": bool(SLACK_BOT_TOKEN) # New check for Slack
@@ -1139,9 +1142,12 @@ def health_check():
 
 @app.route("/")
 def home():
-    total_docs = kb.get_all_documents()["total_documents"] if kb.mongodb_connected else "N/A"
+    # Call get_all_documents once and extract total_documents
+    docs_info = kb.get_all_documents()
+    total_docs = docs_info["total_documents"] if kb.mongodb_connected else "N/A"
+    
     total_chunks = kb.index.ntotal if kb.index and kb.mongodb_connected else "N/A"
-    qa_status = "✅ Loaded (DistilBERT)" if kb.qa_pipeline else "❌ Not loaded"
+    qa_status = "✅ Using Gemini for Generation" if kb.gemini_generation_available else "❌ Generation Unavailable"
     
     gemini_ok_display = bool(
         GEMINI_API_KEY
@@ -1149,21 +1155,24 @@ def home():
         not in ["YOUR_GOOGLE_API_KEY_HERE"]
     )
     
+    # Safely access kb.model_name, as it's set in __init__ with a default
+    model_name_display = getattr(kb, 'model_name', 'Unknown')
+
     return f"""
-    <h1>🚀 RAG Slack AI Bot (Gemini Embeddings)</h1>
+    <h1>🚀 RAG Slack AI Bot (Gemini Embeddings & Generation)</h1>
     <p>Status: {'✅ Running' if kb.mongodb_connected and gemini_ok_display else '⚠️ Critical Configuration Issue!'}</p>
     <h2>🔧 RAG Features:</h2>
     <ul>
-        <li><strong>Embedding Service:</strong> Google Gemini ('{kb.model_name}')</li>
+        <li><strong>Embedding Service:</strong> Google Gemini ('{model_name_display}')</li>
         <li><strong>Vector DB:</strong> FAISS (Inner Product for Cosine Similarity)</li>
-        <li><strong>QA Model:</strong> {'DistilBERT' if kb.qa_pipeline else 'Not Loaded'}</li>
+        <li><strong>Text Generation/QA:</strong> {'Google Gemini (' + kb.gemini_generation_model_id + ')' if kb.gemini_generation_available else 'Unavailable'}</li>
     </ul>
     <h2>📊 Stats:</h2>
     <ul>
-        <li><strong>Embedding Model:</strong> {kb.model_name} (Dim: {kb.embedding_dim})</li>
+        <li><strong>Embedding Model:</strong> {model_name_display} (Dim: {kb.embedding_dim})</li>
         <li><strong>Total Docs in DB:</strong> {total_docs}</li>
         <li><strong>Total Chunks in FAISS:</strong> {total_chunks}</li>
-        <li><strong>QA Model:</strong> {qa_status}</li>
+        <li><strong>Text Generation Status:</strong> {qa_status}</li>
         <li><strong>Gemini API Key:</strong> {'✅ Configured' if gemini_ok_display else '❌ NOT CONFIGURED OR PLACEHOLDER!'}</li>
         <li><strong>MongoDB Connection:</strong> {'✅ Connected' if kb.mongodb_connected else '❌ NOT CONNECTED!'}</li>
         <li><strong>Slack Token:</strong> {'✅ Configured' if SLACK_BOT_TOKEN else '❌ NOT CONFIGURED!'}</li>
@@ -1260,7 +1269,7 @@ if __name__ == "__main__":
 
     if not gemini_ok_startup:
         app.logger.critical(
-            "FATAL: Gemini API Key is not configured correctly. Embedding generation will fail. Please set GOOGLE_API_KEY."
+            "FATAL: Gemini API Key is not configured correctly. Embedding and generation will fail. Please set GOOGLE_API_KEY."
         )
     if not slack_ok_startup:
         app.logger.critical(
@@ -1281,8 +1290,14 @@ if __name__ == "__main__":
 
     app.logger.info("\n" + "=" * 80)
     app.logger.info("🎯 Gemini RAG Bot is ready (or attempting to be)!")
+
+    # Access model_name safely for the startup logs
+    model_name_for_log = getattr(kb, 'model_name', 'Unknown')
+    gemini_gen_model_for_log = getattr(kb, 'gemini_generation_model_id', 'Unknown')
+    gemini_gen_status = 'Gemini (' + gemini_gen_model_for_log + ')' if getattr(kb, 'gemini_generation_available', False) else 'Not available'
+
     app.logger.info(
-        f"   • Embeddings by: Google Gemini ('{kb.model_name}') {'✅' if gemini_ok_startup else '❌ (KEY ISSUE!)'}"
+        f"   • Embeddings by: Google Gemini ('{model_name_for_log}') {'✅' if gemini_ok_startup else '❌ (KEY ISSUE!)'}"
     )
     app.logger.info(
         f"   • Slack Integration: {'✅' if slack_ok_startup else '❌ (TOKEN ISSUE!)'}"
@@ -1291,11 +1306,11 @@ if __name__ == "__main__":
         f"   • MongoDB Connection: {'✅' if mongodb_ok_startup else '❌ (CONNECTION ISSUE!)'}"
     )
     app.logger.info(
-        f"   • QA Model: {'DistilBERT (loaded)' if kb.qa_pipeline else 'Not loaded'}"
+        f"   • Text Generation (QA): {gemini_gen_status}"
     )
     app.logger.info(
         f"🌐 Web interface: http://localhost:{os.environ.get('PORT', 3000)}"
-    ) # Corrected default port to 3000 for consistency
+    )
     app.logger.info("=" * 80 + "\n")
 
     if not gemini_ok_startup or not slack_ok_startup or not mongodb_ok_startup:

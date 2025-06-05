@@ -798,7 +798,7 @@ def enhanced_generate_response(
         response_text = response_text[:700] + "..."
     return (
         f"{confidence_emoji}here's some information:\n\n{response_text}\n\n"
-        # f"Is this helpful? (Relevance: {confidence_score:.2f})"
+        f"Is this helpful?"
     )
 
 

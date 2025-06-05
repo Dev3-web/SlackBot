@@ -692,7 +692,7 @@ with tab5:
                         response = (
                             f"{emoji} Based on my knowledge, here's some information:\n\n"
                             f"{best_result['document'][:500]}...\n\n"
-                            f"Is this helpful? (Relevance: {confidence:.2f})"
+                            f"Is this helpful?"
                         )
                     else:
                         response = "I couldn't find relevant information for your question. 🤔 Could you rephrase or ask about something else?"

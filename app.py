@@ -13,7 +13,6 @@ import faiss
 import pickle
 from typing import List, Dict, Optional
 import openai
-# from transformers import pipeline # REMOVED: No more local Hugging Face models
 import google.generativeai as genai
 from pymongo.errors import PyMongoError
 import gridfs

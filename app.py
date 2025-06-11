@@ -1,6 +1,6 @@
 import os
 import json
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import logging
@@ -8,18 +8,26 @@ from dotenv import load_dotenv
 import re
 import random
 from datetime import datetime
-import numpy as np
-import faiss
-import pickle
-from typing import List, Dict, Optional
-import openai
+import numpy as np # Still useful if interacting with raw embeddings
+import faiss # LangChain uses this, but we might interact less directly
+import pickle # For FAISS persistence
+from typing import List, Dict, Optional, Any
+import openai # Keep if needed elsewhere, but RAG will use Gemini via LangChain
 import google.generativeai as genai
 from pymongo.errors import PyMongoError
-import gridfs
-from bson import ObjectId
+# GridFS removed as we store text, not files, in MongoDB now
+# from bson import ObjectId # Keep if ObjectId is used for MongoDB docs, but doc_id str is fine
 from pymongo import MongoClient
 import PyPDF2
 import io
+
+# --- LangChain Imports ---
+from langchain.docstore.document import Document # Represents a piece of text and metadata
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI # Gemini integration
+from langchain.text_splitter import RecursiveCharacterTextSplitter # Split text into chunks
+from langchain.vectorstores import FAISS # FAISS vector store wrapper
+from langchain.chains import RetrievalQA # Standard RAG chain
+from langchain.prompts import PromptTemplate
 
 # Load environment variables
 load_dotenv()
@@ -27,592 +35,455 @@ load_dotenv()
 app = Flask(__name__)
 app.logger.setLevel(logging.INFO)
 
-# Configure Gemini API Key
+# --- Configuration from Environment Variables ---
+# Use .get for safer access with defaults
 GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")
-if not GEMINI_API_KEY:
-    GEMINI_API_KEY = "YOUR_GOOGLE_API_KEY_HERE" # Placeholder for missing key
-    app.logger.error(
-        "CRITICAL: GOOGLE_API_KEY is not set in environment variables. Gemini features will not work."
-    )
-elif GEMINI_API_KEY == "YOUR_GOOGLE_API_KEY_HERE":
-    app.logger.warning(
-        "WARNING: Gemini API Key is a placeholder. Please set GOOGLE_API_KEY in your .env file."
-    )
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
+MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017/")
+MONGODB_DB_NAME = os.environ.get("MONGODB_DB_NAME", "rag_knowledge_base_lc") # Use a different DB name
+FAISS_INDEX_PATH = os.environ.get("FAISS_INDEX_PATH", "./faiss_index") # Path for FAISS persistence
 
-if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GOOGLE_API_KEY_HERE":
+# --- Critical Dependency Checks ---
+if not GEMINI_API_KEY:
+    app.logger.critical(
+        "FATAL: GOOGLE_API_KEY is not set in environment variables. Embedding and generation will fail."
+    )
+    # Optionally, exit or raise an exception here if this is absolutely required for startup
+    # import sys; sys.exit("GOOGLE_API_KEY not set.")
+
+if not SLACK_BOT_TOKEN:
+    app.logger.critical(
+        "FATAL: SLACK_BOT_TOKEN not found in environment variables. Slack integration will fail."
+    )
+    # Optionally, exit or raise an exception here
+    # import sys; sys.exit("SLACK_BOT_TOKEN not set.")
+
+# --- Initialize Google Generative AI (for raw calls or direct usage) ---
+# This is separate from LangChain's wrapper but good for initial checks
+if GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        app.logger.info("Gemini API Key configured.")
+        app.logger.info("Gemini API Key configured via genai.")
+        # Optional: Test a simple call to verify key
+        # genai.list_models()
     except Exception as e:
-        app.logger.critical(f"Failed to configure Gemini API: {e}. Please check your key.")
+        app.logger.critical(f"Failed to configure Gemini API via genai: {e}. Please check your key.")
 else:
-    app.logger.error(
-        "CRITICAL: Gemini API Key is not configured. The application will likely fail to get embeddings and generate responses."
-    )
+     app.logger.warning("Gemini API Key not configured. Direct genai calls may fail.")
 
-# Initialize Flask app
-MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017/")
-MONGODB_DB_NAME = os.environ.get("MONGODB_DB_NAME", "rag_knowledge_base")
-
-# Initialize Slack client
-SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
-if not SLACK_BOT_TOKEN:
-    app.logger.error(
-        "CRITICAL: SLACK_BOT_TOKEN not found in environment variables. Slack integration will fail."
-    )
-slack_client = WebClient(token=SLACK_BOT_TOKEN)
-
-
-# Initialize OpenAI (optional - for better response generation)
+# --- Initialize OpenAI (optional - if you still want it for non-RAG things) ---
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
-    app.logger.info("OpenAI API Key configured (optional feature).")
+    app.logger.info("OpenAI API Key configured (optional).")
 else:
-    app.logger.info(
-        "OpenAI API Key not found. OpenAI dependent features will be unavailable."
-    )
+    app.logger.info("OpenAI API Key not found. OpenAI dependent features will be unavailable.")
 
-class EnhancedRAGKnowledgeBase:
+
+# --- LangChain RAG Setup ---
+class LangchainRAGKnowledgeBase:
     def __init__(self):
-        # Initialize attributes with default/safe values first
         self.mongodb_connected = False
         self.mongo_client = None
         self.db = None
         self.documents_collection = None
-        self.chunks_collection = None
-        self.gridfs = None
-        self.gemini_embedding_model_id = "models/text-embedding-004"
-        self.gemini_generation_model_id = "gemini-pro"
-        self.model_name = self.gemini_embedding_model_id # Set here too
-        self.embedding_dim = 768
-        self.index = faiss.IndexFlatIP(self.embedding_dim)
-        self.doc_ids = []
-        self.doc_texts = []
-        self.doc_metadatas = []
-        self.gemini_generation_available = False
 
-        # MongoDB setup
+        # MongoDB Setup (only for storing original docs and metadata)
         try:
-            # FIX: Added a serverSelectionTimeoutMS to fail faster if MongoDB is unavailable.
             self.mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
             self.db = self.mongo_client[MONGODB_DB_NAME]
-            self.documents_collection = self.db.documents
-            self.chunks_collection = self.db.document_chunks
-            self.gridfs = gridfs.GridFS(self.db)
+            self.documents_collection = self.db.original_documents # New collection name
             
-            # Create indexes for better performance
+            # Create index for doc_id
             self.documents_collection.create_index("doc_id", unique=True)
-            self.chunks_collection.create_index("doc_id")
-            self.chunks_collection.create_index("chunk_id", unique=True)
-            self.chunks_collection.create_index([("doc_id", 1), ("chunk_index", 1)])
             
-            # Test connection
-            self.mongo_client.admin.command('ping') 
-            app.logger.info(f"✅ Connected to MongoDB: {MONGODB_URI}")
+            self.mongo_client.admin.command('ping')
+            app.logger.info(f"✅ Connected to MongoDB: {MONGODB_URI} (DB: {MONGODB_DB_NAME})")
             self.mongodb_connected = True
         except Exception as e:
             app.logger.error(f"❌ Failed to connect to MongoDB at {MONGODB_URI}: {e}")
             self.mongodb_connected = False
-            # Exit early if MongoDB connection is critical for your app to function.
-            # Otherwise, allow it to continue but mark as not connected.
-            # raise # Uncomment this if you want the app to crash if DB isn't available
 
-        app.logger.info(
-            f"Initializing RAG with Gemini models: Embedding='{self.gemini_embedding_model_id}' (Dim: {self.embedding_dim}), Generation='{self.gemini_generation_model_id}'"
+        # LangChain Component Setup
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500, chunk_overlap=50
         )
 
-        # QA Pipeline setup (Now uses Gemini for generation instead of a local model)
-        if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GOOGLE_API_KEY_HERE":
-            try:
-                # Test if gemini-pro is accessible
-                genai.GenerativeModel(self.gemini_generation_model_id).generate_content("test", stream=True).resolve()
-                self.gemini_generation_available = True
-                app.logger.info(f"Gemini generation model '{self.gemini_generation_model_id}' is available.")
-            except Exception as e:
-                app.logger.warning(f"Gemini generation model '{self.gemini_generation_model_id}' not available. Error: {e}. Answers will use only retrieved context.")
-        else:
-            app.logger.warning("Gemini API key not configured for generation. Answers will use only retrieved context.")
-
-
-        # Only attempt to load embeddings if MongoDB is connected and Gemini API key is set
-        if self.mongodb_connected and GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GOOGLE_API_KEY_HERE":
-            self.load_existing_embeddings()
-        elif not self.mongodb_connected:
-            app.logger.warning("Skipping load_existing_embeddings: MongoDB connection failed (from __init__).")
-        else:
-            app.logger.warning("Skipping load_existing_embeddings: Gemini API key not configured (from __init__).")
-
-
-    def chunk_text(self, text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
-        if not text or len(text.strip()) == 0:
-            return []
-        if len(text) <= chunk_size:
-            return [text]
-        chunks = []
-        start = 0
-        while start < len(text):
-            end = start + chunk_size
-            current_chunk_text = text[start:end]
-            if end >= len(text):
-                chunks.append(text[start:])
-                break
-            # Find a natural breakpoint within the chunk, but not too close to the start
-            last_period = current_chunk_text.rfind(".")
-            last_newline = current_chunk_text.rfind("\n")
-            
-            # Prioritize a breakpoint if it's within the last half of the chunk
-            # or if it's the only option near the end.
-            break_point = -1
-            if last_period > chunk_size * 0.7: # If a period is in the last 30% of chunk
-                break_point = last_period
-            elif last_newline > chunk_size * 0.7: # If a newline is in the last 30%
-                break_point = last_newline
-            elif last_period != -1: # Otherwise, take the last period
-                break_point = last_period
-            elif last_newline != -1: # Or last newline
-                break_point = last_newline
-
-            if break_point != -1 and break_point > chunk_size // 2: # Ensure it's past mid-point for good breaks
-                end = start + break_point + 1 # +1 to include the delimiter
-            
-            chunks.append(text[start:end].strip()) # Add stripped chunk
-            
-            next_start = end - overlap
-            if next_start <= start: # Prevent infinite loop if overlap is too large or chunk is small
-                start = end
-            else:
-                start = next_start
-        return [c for c in chunks if c.strip()] # Filter out empty chunks
-
-    def get_embedding(self, text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> np.ndarray:
-        """Generate embedding for text using Gemini."""
-        if (
-            not GEMINI_API_KEY
-            or GEMINI_API_KEY == "YOUR_GOOGLE_API_KEY_HERE"
-        ):
-            app.logger.error("Gemini API key not configured. Cannot generate embeddings.")
-            return np.zeros(self.embedding_dim, dtype=np.float32)
-
-        if not text or not text.strip():
-            app.logger.warning("Attempted to get embedding for empty text. Returning zero vector.")
-            return np.zeros(self.embedding_dim, dtype=np.float32)
+        # Ensure Gemini API key is available for LangChain embeddings and LLM
+        if not GEMINI_API_KEY:
+             self.embeddings = None
+             self.llm = None
+             self.retriever = None
+             self.qa_chain = None
+             self.langchain_ready = False
+             app.logger.critical("LangChain RAG not initialized: GOOGLE_API_KEY is missing.")
+             return
 
         try:
-            # Gemini has a 3072 token limit for embed_content.
-            # Truncate if necessary, though chunking should handle most cases.
-            # For robust production, consider tokenizers to accurately count tokens
-            if len(text) > 2048: # Rough estimate, actual token count can vary
-                text = text[:2048] 
-                app.logger.warning("Truncated text for embedding due to length.")
-
-            result = genai.embed_content(
-                model=self.gemini_embedding_model_id,
-                content=text,
-                task_type=task_type,
+            self.embeddings = GoogleGenerativeAIEmbeddings(
+                model="models/text-embedding-004", # Use the recommended embedding model
+                task_type="RETRIEVAL_DOCUMENT" # Default task type for embeddings
             )
-            embedding = np.array(result["embedding"], dtype=np.float32)
-            return embedding
+            self.embedding_dim = 768 # As per models/text-embedding-004 documentation
+
+            self.llm = ChatGoogleGenerativeAI(model="gemini-pro") # Use gemini-pro for chat/QA
+
+            # --- FAISS Vector Store Setup ---
+            # Try loading existing index
+            try:
+                self.vectorstore = FAISS.load_local(
+                    folder_path=FAISS_INDEX_PATH,
+                    embeddings=self.embeddings,
+                    allow_dangerous_deserialization=True # Required for loading arbitrary pickle/json
+                )
+                app.logger.info(f"✅ Loaded existing FAISS index from {FAISS_INDEX_PATH}")
+            except Exception as e:
+                app.logger.warning(f"FAISS index not found or failed to load from {FAISS_INDEX_PATH}: {e}. Creating a new one.")
+                # If loading fails, create a new empty index
+                # Need an initial dummy document to create the index structure
+                # This is a common FAISS-LangChain quirk for empty indexes
+                # A better way might be to create an empty FAISS index manually if load fails
+                # Let's create an index only when the first document is added
+                self.vectorstore = None # Will be initialized on first add_document
+
+
+            # --- RetrievalQA Chain Setup ---
+            # Define the prompt template
+            template = """
+            You are an AI assistant designed to answer questions based *only* on the following context.
+            If the answer is not found in the context, please state that you cannot find the answer in the provided information.
+            Do not make up information.
+
+            Context:
+            {context}
+
+            Question:
+            {question}
+
+            Answer:
+            """
+            QA_CHAIN_PROMPT = PromptTemplate.from_template(template)
+
+            if self.vectorstore:
+                 self.retriever = self.vectorstore.as_retriever()
+                 self.qa_chain = RetrievalQA.from_chain_type(
+                    llm=self.llm,
+                    chain_type="stuff", # Uses all context in one go
+                    retriever=self.retriever,
+                    chain_type_kwargs={"prompt": QA_CHAIN_PROMPT},
+                    return_source_documents=True # To get retrieved docs back
+                )
+            else:
+                self.retriever = None
+                self.qa_chain = None
+                app.logger.warning("FAISS index not loaded or created yet. RAG chain will be initialized on first document add.")
+
+
+            self.langchain_ready = True
+            app.logger.info("✅ LangChain RAG components initialized.")
+
         except Exception as e:
-            app.logger.error(f"Error generating Gemini embedding for text (first 50 chars): '{text[:50]}...': {e}")
-            return np.zeros(self.embedding_dim, dtype=np.float32)
+            app.logger.critical(f"❌ Failed to initialize LangChain RAG components: {e}", exc_info=True)
+            self.embeddings = None
+            self.llm = None
+            self.retriever = None
+            self.qa_chain = None
+            self.langchain_ready = False
+
 
     def add_document(self, doc_id: str, text: str, metadata: Optional[Dict] = None):
         if not self.mongodb_connected:
             app.logger.error(f"Cannot add document {doc_id}: MongoDB is not connected.")
-            return
-
-        if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GOOGLE_API_KEY_HERE":
-            app.logger.error(f"Cannot add document {doc_id}: Gemini API key not configured.")
-            return
+            raise ConnectionError("MongoDB is not connected.") # Indicate failure
+            
+        if not self.langchain_ready:
+            app.logger.error(f"Cannot add document {doc_id}: LangChain RAG components not ready (likely Gemini API issue).")
+            raise RuntimeError("LangChain RAG components not ready.") # Indicate failure
 
         try:
-            # Store document in MongoDB
+            # 1. Store original document in MongoDB (Upsert)
             doc_data = {
                 "doc_id": doc_id,
-                "text": text, # Store full text for retrieval if needed
+                "text": text,
                 "metadata": metadata or {},
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow()
             }
-            
-            # Use upsert to update if exists. This will replace the entire document and its chunks.
-            # Store full text in documents collection, not embedding here, as chunks have embeddings
+            # Delete existing doc and its chunks first if updating
+            self.delete_document(doc_id, skip_mongo_delete=True) # Delete FAISS chunks, keep mongo for now
+
             self.documents_collection.replace_one(
-                {"doc_id": doc_id}, 
-                doc_data, 
+                {"doc_id": doc_id},
+                doc_data,
                 upsert=True
             )
+            app.logger.info(f"Added/Updated original document {doc_id} in MongoDB.")
 
-            # Process chunks
-            chunks = self.chunk_text(text)
+            # 2. Process for LangChain/FAISS
+            lc_document = Document(page_content=text, metadata={**(metadata or {}), "doc_id": doc_id})
+
+            # Split into chunks
+            chunks = self.text_splitter.split_documents([lc_document])
+            app.logger.info(f"Split document {doc_id} into {len(chunks)} chunks.")
+
             if not chunks:
-                app.logger.warning(f"No chunks generated for document {doc_id}. Document added but no chunks for search.")
+                app.logger.warning(f"No chunks generated for document {doc_id}. Document stored, but not searchable.")
                 return
 
-            # Remove existing chunks for this document
-            self.chunks_collection.delete_many({"doc_id": doc_id})
+            # 3. Add chunks to FAISS
+            if self.vectorstore is None:
+                 # Initialize FAISS index if it doesn't exist
+                 app.logger.info(f"Initializing new FAISS index with first {len(chunks)} chunks.")
+                 self.vectorstore = FAISS.from_documents(
+                    chunks,
+                    self.embeddings
+                 )
+                 self.retriever = self.vectorstore.as_retriever()
+                 # Re-initialize the QA chain with the new vectorstore
+                 self.qa_chain = RetrievalQA.from_chain_type(
+                    llm=self.llm,
+                    chain_type="stuff",
+                    retriever=self.retriever,
+                    chain_type_kwargs={"prompt": PromptTemplate.from_template("""
+                        You are an AI assistant designed to answer questions based *only* on the following context.
+                        If the answer is not found in the context, please state that you cannot find the answer in the provided information.
+                        Do not make up information.
 
-            # Add new chunks
-            chunk_documents = []
-            for i, chunk_text_content in enumerate(chunks):
-                chunk_id = f"{doc_id}_chunk_{i}"
-                chunk_embedding = self.get_embedding(
-                    chunk_text_content, task_type="RETRIEVAL_DOCUMENT"
+                        Context:
+                        {context}
+
+                        Question:
+                        {question}
+
+                        Answer:
+                        """)},
+                    return_source_documents=True
                 )
-                
-                chunk_doc = {
-                    "chunk_id": chunk_id,
-                    "doc_id": doc_id,
-                    "chunk_text": chunk_text_content,
-                    "chunk_embedding": chunk_embedding.tolist(), # Store as list for MongoDB
-                    "chunk_index": i,
-                    "created_at": datetime.utcnow()
-                }
-                chunk_documents.append(chunk_doc)
+            else:
+                # Add documents to existing index
+                self.vectorstore.add_documents(chunks)
+                app.logger.info(f"Added {len(chunks)} chunks to existing FAISS index for document {doc_id}.")
 
-            if chunk_documents:
-                self.chunks_collection.insert_many(chunk_documents)
+            # 4. Save FAISS index
+            self.vectorstore.save_local(FAISS_INDEX_PATH)
+            app.logger.info(f"Saved FAISS index to {FAISS_INDEX_PATH}.")
 
-            app.logger.info(
-                f"Added/Updated document: {doc_id} with {len(chunks)} chunks in MongoDB."
-            )
-            
-            # Reload FAISS index after adding/updating documents
-            self.load_existing_embeddings()
+            app.logger.info(f"Successfully processed and indexed document: {doc_id}")
 
         except PyMongoError as e:
             app.logger.error(f"MongoDB error adding document {doc_id}: {e}")
-            raise # Re-raise to indicate failure to the caller
+            raise # Re-raise to indicate failure
         except Exception as e:
-            app.logger.error(f"Error adding document {doc_id}: {e}")
+            app.logger.error(f"Error adding document {doc_id} to LangChain/FAISS: {e}", exc_info=True)
             raise # Re-raise
 
-    def load_existing_embeddings(self):
-        """Load embeddings from MongoDB into FAISS index."""
-        if not self.mongodb_connected:
-            app.logger.warning("Cannot load embeddings: MongoDB is not connected.")
-            return
-        
-        app.logger.info("Loading existing embeddings from MongoDB into FAISS index...")
+    def search_and_answer(self, query: str) -> Dict[str, Any]:
+        """Uses the LangChain QA chain to find relevant docs and generate an answer."""
+        if not self.langchain_ready or self.qa_chain is None:
+             app.logger.error("LangChain RAG chain is not ready.")
+             return {
+                 "answer": "Sorry, my knowledge base is not ready to answer questions right now.",
+                 "source_documents": [],
+                 "query": query
+             }
         
         try:
-            # Reset FAISS index
-            self.index = faiss.IndexFlatIP(self.embedding_dim)
-            self.doc_ids, self.doc_texts, self.doc_metadatas = [], [], []
+            # The qa_chain performs both retrieval (from vectorstore) and generation (with LLM)
+            result = self.qa_chain({"query": query})
             
-            # Get all chunks with their parent document metadata
-            pipeline = [
-                {
-                    "$lookup": {
-                        "from": "documents", # The collection to join with
-                        "localField": "doc_id", # Field from the input documents (chunks)
-                        "foreignField": "doc_id", # Field from the "documents" collection
-                        "as": "document_details" # Output array field
-                    }
-                },
-                {
-                    "$unwind": "$document_details" # Deconstructs the document_details array field from the input documents to output a document for each element.
-                },
-                {
-                    "$project": { # Selects which fields to return
-                        "chunk_id": 1,
-                        "chunk_text": 1,
-                        "chunk_embedding": 1,
-                        "document_metadata": "$document_details.metadata" # Get metadata from the joined document
-                    }
-                },
-                {
-                    "$sort": {"chunk_id": 1} # Consistent order
-                }
-            ]
-            
-            all_chunks_data = list(self.chunks_collection.aggregate(pipeline))
-            
-            if not all_chunks_data:
-                app.logger.info("No chunks found in MongoDB to load into FAISS index.")
-                return
+            # result will contain 'answer' and 'source_documents' if return_source_documents=True
+            app.logger.info(f"LangChain QA chain executed for query: '{query[:50]}...'")
 
-            embeddings_to_add = []
-            
-            for chunk_data in all_chunks_data:
-                try:
-                    chunk_embedding = chunk_data.get("chunk_embedding")
-                    if not chunk_embedding:
-                        app.logger.warning(f"Skipping chunk {chunk_data['chunk_id']}: no embedding found.")
-                        continue
-                    
-                    embedding = np.array(chunk_embedding, dtype=np.float32)
-                    if embedding.shape[0] != self.embedding_dim:
-                        app.logger.warning(
-                            f"Skipping chunk {chunk_data['chunk_id']}: embedding dimension mismatch (expected {self.embedding_dim}, got {embedding.shape[0]})."
-                        )
-                        continue
-                    
-                    embeddings_to_add.append(embedding)
-                    self.doc_ids.append(chunk_data["chunk_id"])
-                    self.doc_texts.append(chunk_data["chunk_text"])
-                    self.doc_metadatas.append(chunk_data.get("document_metadata", {})) # Use .get with default for safety
-                    
-                except Exception as e:
-                    app.logger.warning(f"Error processing chunk {chunk_data.get('chunk_id', 'unknown')}: {e}")
+            # Extract relevant info from source_documents
+            # Source documents from FAISS will have 'metadata' which includes our 'doc_id'
+            retrieved_docs_info = []
+            for doc in result.get("source_documents", []):
+                 retrieved_docs_info.append({
+                      "page_content": doc.page_content,
+                      "metadata": doc.metadata,
+                      # FAISS search results implicitly have a score, but RetrievalQA chain doesn't easily expose per-doc scores directly here
+                      # If scores are needed, we would need to run retriever.get_relevant_documents(query, return_scores=True) separately
+                      # For simplicity with RetrievalQA chain, we won't include scores here by default
+                 })
 
-            if embeddings_to_add:
-                embeddings_array = np.array(embeddings_to_add, dtype=np.float32)
-                self.index.add(embeddings_array)
-                app.logger.info(f"Successfully loaded {self.index.ntotal} embeddings into FAISS from MongoDB.")
-            else:
-                app.logger.info("No compatible embeddings found to load into FAISS.")
-                
-        except PyMongoError as e:
-            app.logger.error(f"MongoDB error loading embeddings: {e}")
-        except Exception as e:
-            app.logger.error(f"Error loading embeddings into FAISS: {e}")
-
-    def semantic_search(self, query: str, n_results: int = 5, score_threshold: float = 0.5) -> Dict:
-        try:
-            if self.index.ntotal == 0:
-                app.logger.warning("FAISS index empty. Cannot search.")
-                return {"documents": [], "scores": [], "metadatas": [], "ids": []}
-            
-            query_embedding = self.get_embedding(query, task_type="RETRIEVAL_QUERY")
-            if np.all(query_embedding == 0): # Check if embedding failed (all zeros)
-                app.logger.warning("Query embedding failed (returned zero vector). Cannot search.")
-                return {"documents": [], "scores": [], "metadatas": [], "ids": []}
-            
-            query_embedding = query_embedding.reshape(1, -1).astype(np.float32)
-            scores, indices = self.index.search(
-                query_embedding, k=min(n_results, self.index.ntotal)
-            )
-
-            results_data = {"documents": [], "scores": [], "metadatas": [], "ids": []}
-            for score, idx in zip(scores[0], indices[0]):
-                # Ensure index is valid and score is above threshold
-                if (
-                    score >= score_threshold
-                    and idx != -1
-                    and 0 <= idx < len(self.doc_texts) # Check bounds of our lists
-                ):
-                    results_data["documents"].append(self.doc_texts[idx])
-                    results_data["scores"].append(float(score))
-                    results_data["metadatas"].append(self.doc_metadatas[idx])
-                    results_data["ids"].append(self.doc_ids[idx])
-            
-            return results_data
-        except Exception as e:
-            app.logger.error(f"Error in semantic search for query '{query[:50]}...': {e}")
-            return {"documents": [], "scores": [], "metadatas": [], "ids": []}
-
-    def hybrid_search(self, query: str, n_results: int = 5) -> Dict:
-        # Get more semantic results initially to combine with keyword
-        semantic_results = self.semantic_search(query, n_results * 2, score_threshold=0.3) # Lower threshold for more candidates
-        combined_results = {}
-        query_words_kw = set(re.findall(r"\w+", query.lower()))
-
-        for doc_chunk, score, metadata, chunk_id in zip(
-            semantic_results["documents"],
-            semantic_results["scores"],
-            semantic_results["metadatas"],
-            semantic_results["ids"],
-        ):
-            # Semantic score is directly from FAISS (cosine similarity)
-            semantic_component = score 
-            
-            keyword_score_for_chunk = 0
-            if query_words_kw:
-                chunk_text_words = set(re.findall(r"\w+", doc_chunk.lower()))
-                common_words = query_words_kw.intersection(chunk_text_words)
-                if common_words:
-                    # Jaccard index for keyword similarity
-                    keyword_score_for_chunk = len(common_words) / len(
-                        query_words_kw.union(chunk_text_words)
-                    )
-
-            # Combine scores (adjust weights as needed)
-            # A simple weighted sum: 0.7 for semantic, 0.3 for keyword
-            final_score = (semantic_component * 0.7) + (keyword_score_for_chunk * 0.3)
-
-            combined_results[chunk_id] = {
-                "document": doc_chunk,
-                "semantic_score": score,
-                "keyword_score": keyword_score_for_chunk,
-                "metadata": metadata,
-                "id": chunk_id,
-                "final_score": final_score,
-            }
-
-        sorted_results_list = sorted(
-            combined_results.values(), key=lambda x: x["final_score"], reverse=True
-        )[:n_results]
-        
-        return {
-            "documents": [r["document"] for r in sorted_results_list],
-            "scores": [r["final_score"] for r in sorted_results_list],
-            "metadatas": [r["metadata"] for r in sorted_results_list],
-            "ids": [r["id"] for r in sorted_results_list],
-            "semantic_scores": [r["semantic_score"] for r in sorted_results_list],
-            "keyword_scores": [r["keyword_score"] for r in sorted_results_list],
-        }
-
-    def simple_keyword_search(self, query: str, n_results: int = 3) -> Dict:
-        try:
-            query_words = set(re.findall(r"\w+", query.lower()))
-            if not query_words:
-                return {"documents": [], "scores": [], "metadatas": [], "ids": []}
-
-            regex_query = "(?i)" + "|".join(re.escape(word) for word in query_words)
-            
-            documents_from_db = list(self.documents_collection.find(
-                {"text": {"$regex": regex_query, "$options": "i"}}
-            ).limit(n_results * 5)) # Fetch more than n_results to allow for internal scoring
-            
-            if not documents_from_db:
-                return {"documents": [], "scores": [], "metadatas": [], "ids": []}
-
-            scored_docs = []
-            for doc in documents_from_db:
-                text_words = set(re.findall(r"\w+", doc["text"].lower()))
-                common_words = query_words.intersection(text_words)
-                
-                score = 0
-                if query_words.union(text_words): # Avoid division by zero
-                    score = len(common_words) / len(query_words.union(text_words))
-                
-                if score > 0: # Only add if there's a match
-                    scored_docs.append((score, doc["text"], doc["metadata"], doc["doc_id"]))
-
-            scored_docs.sort(reverse=True, key=lambda x: x[0])
-            top_docs = scored_docs[:n_results]
-            
             return {
-                "documents": [d[1] for d in top_docs],
-                "scores": [d[0] for d in top_docs],
-                "metadatas": [d[2] for d in top_docs],
-                "ids": [d[3] for d in top_docs],
+                "answer": result.get("answer", "I couldn't find a direct answer based on the provided information."),
+                "retrieved_documents": retrieved_docs_info,
+                "query": query
             }
-        except PyMongoError as e:
-            app.logger.error(f"MongoDB error in keyword search: {e}")
-            return {"documents": [], "scores": [], "metadatas": [], "ids": []}
+
         except Exception as e:
-            app.logger.error(f"Error in keyword search: {e}")
-            return {"documents": [], "scores": [], "metadatas": [], "ids": []}
+            app.logger.error(f"Error during LangChain QA chain execution for query '{query[:50]}...': {e}", exc_info=True)
+            return {
+                "answer": f"An error occurred while generating the answer. {e}",
+                "retrieved_documents": [],
+                "query": query
+            }
 
-    # MODIFIED: Now uses Gemini for generation instead of a local QA model
-    def generate_answer_with_llm(self, question: str, context: str) -> str:
-        if not self.gemini_generation_available:
-            app.logger.warning("Gemini generation model not available. Returning raw context.")
-            return context[:500] + "..." if len(context) > 500 else context
-        
-        try:
-            model = genai.GenerativeModel(self.gemini_generation_model_id)
-            
-            # Craft a prompt for Gemini for RAG
-            prompt = (
-                f"You are an AI assistant. Answer the following question based only on the provided context. "
-                f"If the answer cannot be found in the context, respond with 'I couldn't find a direct answer based on the provided information.'"
-                f"\n\nContext:\n{context}\n\nQuestion: {question}\n\nAnswer:"
-            )
-            
-            # Gemini has token limits for prompts. Adjust context if needed.
-            # Max input for gemini-pro is 30720 tokens. We'll use a conservative char limit.
-            if len(prompt) > 20000: # Very rough estimate, actual token count will vary
-                app.logger.warning("Prompt too long for Gemini, truncating context.")
-                # This could be more intelligent, e.g., using a tokenizer to get token count
-                context = context[:(20000 - len(question) - 100)] # Leave space for question and prompt text
-                prompt = (
-                    f"You are an AI assistant. Answer the following question based only on the provided context. "
-                    f"If the answer cannot be found in the context, respond with 'I couldn't find a direct answer based on the provided information.'"
-                    f"\n\nContext:\n{context}\n\nQuestion: {question}\n\nAnswer:"
-                )
-
-
-            response = model.generate_content(prompt)
-            # Access response.text directly to get the generated string
-            return response.text
-        except Exception as e:
-            app.logger.error(f"Error generating answer with Gemini LLM: {e}")
-            return context[:500] + "..." if len(context) > 500 else context
-
-    def search(self, query: str, n_results: int = 3, use_hybrid: bool = True) -> Dict:
-        if use_hybrid:
-            return self.hybrid_search(query, n_results)
-        results = self.semantic_search(query, n_results)
-        results["semantic_scores"] = results.get("scores", [])
-        results["keyword_scores"] = [0.0] * len(results.get("documents", []))
-        return results
 
     def get_all_documents(self):
+        """Get summary of original documents from MongoDB."""
         if not self.mongodb_connected:
             app.logger.error("Cannot get all documents: MongoDB is not connected.")
-            return {"ids": [], "documents": [], "metadatas": [], "total_documents": 0} # Return total_documents
-            
+            return {"ids": [], "documents": [], "metadatas": [], "total_documents": 0}
+
         try:
-            # Fetch all documents, but only return necessary fields for summary
             documents = list(self.documents_collection.find({}, {"doc_id": 1, "text": 1, "metadata": 1}))
             return {
                 "ids": [doc["doc_id"] for doc in documents],
-                "documents": [doc["text"] for doc in documents],
+                "documents": [doc["text"] for doc in documents], # Full text stored in MongoDB
                 "metadatas": [doc["metadata"] for doc in documents],
-                "total_documents": len(documents) # Added for clarity
+                "total_documents": len(documents)
             }
         except PyMongoError as e:
             app.logger.error(f"MongoDB error getting all documents: {e}")
             return {"ids": [], "documents": [], "metadatas": [], "total_documents": 0}
         except Exception as e:
-            app.logger.error(f"Error getting all documents: {e}")
+            app.logger.error(f"Error getting all documents from MongoDB: {e}")
             return {"ids": [], "documents": [], "metadatas": [], "total_documents": 0}
 
-    def delete_document(self, doc_id: str) -> bool:
-        """Delete a document and its chunks from MongoDB."""
-        if not self.mongodb_connected:
-            app.logger.error(f"Cannot delete document {doc_id}: MongoDB is not connected.")
-            return False
-            
-        try:
-            # Delete document
-            doc_result = self.documents_collection.delete_one({"doc_id": doc_id})
-            # Delete chunks
-            chunk_result = self.chunks_collection.delete_many({"doc_id": doc_id})
-            
-            if doc_result.deleted_count > 0:
-                app.logger.info(f"Deleted document {doc_id} and {chunk_result.deleted_count} chunks")
-                self.load_existing_embeddings()  # Reload FAISS index
-                return True
-            else:
-                app.logger.warning(f"Document {doc_id} not found for deletion.")
-                return False
-        except PyMongoError as e:
-            app.logger.error(f"MongoDB error deleting document {doc_id}: {e}")
-            return False
-        except Exception as e:
-            app.logger.error(f"Error deleting document {doc_id}: {e}")
-            return False
+    def delete_document(self, doc_id: str, skip_mongo_delete: bool = False) -> bool:
+        """Delete an original document from MongoDB and its corresponding chunks from FAISS."""
+        
+        # First, attempt to delete from FAISS
+        faiss_deleted = False
+        if self.vectorstore and self.langchain_ready:
+            try:
+                # Find chunk IDs associated with this doc_id in FAISS metadata
+                # FAISS in LangChain currently doesn't have a direct delete_by_metadata method.
+                # A common workaround is to search for related chunks, get their internal IDs, and delete by ID.
+                # Or, if you know how metadata is stored, interact with the underlying index.
+                # A simpler approach might involve creating a new index without the deleted documents,
+                # but that's inefficient for single deletions.
+                # LangChain's FAISS wrapper has a `delete` method that takes a list of ids (which correspond to the order added)
+                # or a list of internal document indices. This is tricky without direct ID lookup.
+
+                # Let's try a simplified approach: Get all docs from vectorstore and filter
+                # This is NOT efficient for large indexes, but works for a simple example.
+                # A proper solution might involve a custom FAISS subclass or tracking LC doc IDs.
+
+                # Alternative: Rebuild index (inefficient but works) or use a DB that supports filtered deletion (e.g., Milvus, Pinecone)
+                # Given the constraint to use FAISS, finding exact chunks to delete is hard.
+                # Let's log a warning about the limitation and proceed with MongoDB deletion.
+                # For a real app, you'd need to manage chunk IDs when adding to FAISS and store them in MongoDB
+                # or use a vector store with better deletion by metadata support.
+
+                # *** SIMPLIFIED DELETION ***
+                # We will only delete from MongoDB and rebuild the FAISS index from scratch
+                # with remaining documents. This is resource-intensive but correct for this example's limitations.
+
+                # Rebuild FAISS index from remaining documents after MongoDB deletion
+                app.logger.warning(f"Attempting to delete document {doc_id} from FAISS by rebuilding the index (inefficient).")
+                faiss_deleted = True # Assume rebuild covers FAISS deletion conceptually
+
+
+            except Exception as e:
+                 app.logger.error(f"Error deleting document {doc_id} chunks from FAISS (rebuild method failed?): {e}")
+                 # Continue to delete from MongoDB even if FAISS fails, to avoid inconsistency
+
+        # Second, attempt to delete from MongoDB
+        mongo_deleted = False
+        if not skip_mongo_delete and self.mongodb_connected:
+            try:
+                doc_result = self.documents_collection.delete_one({"doc_id": doc_id})
+                if doc_result.deleted_count > 0:
+                    app.logger.info(f"Deleted document {doc_id} from MongoDB.")
+                    mongo_deleted = True
+                else:
+                    app.logger.warning(f"Document {doc_id} not found in MongoDB for deletion.")
+            except PyMongoError as e:
+                app.logger.error(f"MongoDB error deleting document {doc_id}: {e}")
+                raise # Re-raise failure
+            except Exception as e:
+                 app.logger.error(f"Error deleting document {doc_id} from MongoDB: {e}")
+                 raise # Re-raise failure
+
+        # If MongoDB deletion was successful (or skipped) and we are rebuilding FAISS
+        if (mongo_deleted or skip_mongo_delete) and self.langchain_ready:
+            try:
+                # Rebuild FAISS index from remaining documents in MongoDB
+                remaining_docs = list(self.documents_collection.find({}))
+                if remaining_docs:
+                    app.logger.info(f"Rebuilding FAISS index with {len(remaining_docs)} remaining documents.")
+                    all_text = "\n---\n".join([doc["text"] for doc in remaining_docs])
+                    # Need to re-process all remaining docs individually to get metadata linked
+                    lc_docs_to_rebuild = [
+                        Document(page_content=doc["text"], metadata={**(doc.get("metadata", {})), "doc_id": doc["doc_id"]})
+                        for doc in remaining_docs
+                    ]
+                    all_chunks = self.text_splitter.split_documents(lc_docs_to_rebuild)
+
+                    if all_chunks:
+                         self.vectorstore = FAISS.from_documents(all_chunks, self.embeddings)
+                         self.vectorstore.save_local(FAISS_INDEX_PATH)
+                         self.retriever = self.vectorstore.as_retriever()
+                         # Re-initialize the QA chain if the vectorstore was just created/replaced
+                         self.qa_chain = RetrievalQA.from_chain_type(
+                            llm=self.llm,
+                            chain_type="stuff",
+                            retriever=self.retriever,
+                            chain_type_kwargs={"prompt": PromptTemplate.from_template("""
+                                You are an AI assistant designed to answer questions based *only* on the following context.
+                                If the answer is not found in the context, please state that you cannot find the answer in the provided information.
+                                Do not make up information.
+
+                                Context:
+                                {context}
+
+                                Question:
+                                {question}
+
+                                Answer:
+                                """)},
+                            return_source_documents=True
+                        )
+                         app.logger.info(f"Rebuilt FAISS index with {self.vectorstore.index.ntotal} chunks from {len(remaining_docs)} documents.")
+                    else:
+                         # If no documents remain, delete the FAISS index files and reset vectorstore
+                         app.logger.info("No documents remaining after deletion. Deleting FAISS index files.")
+                         self.vectorstore = None # Reset vectorstore
+                         self.retriever = None
+                         self.qa_chain = None
+                         if os.path.exists(FAISS_INDEX_PATH):
+                             import shutil
+                             shutil.rmtree(FAISS_INDEX_PATH)
+                             app.logger.info(f"Deleted FAISS index directory: {FAISS_INDEX_PATH}")
+
+
+            except Exception as e:
+                 app.logger.error(f"Error rebuilding FAISS index after deleting {doc_id}: {e}", exc_info=True)
+                 # Index might be in an inconsistent state. Log and move on.
+
+        # Return True if the MongoDB deletion happened, as that's the primary record
+        return mongo_deleted
+
 
     def get_database_stats(self):
-        """Get statistics about the MongoDB database."""
-        if not self.mongodb_connected:
-            app.logger.error("Cannot get database stats: MongoDB is not connected.")
-            return {"error": "MongoDB not connected", "mongodb_connected": False}
-            
-        try:
-            doc_count = self.documents_collection.count_documents({})
-            chunk_count = self.chunks_collection.count_documents({})
-            
-            return {
-                "total_documents": doc_count,
-                "total_chunks": chunk_count,
-                "faiss_index_size": self.index.ntotal if self.index else 0,
-                "embedding_dimension": self.embedding_dim,
-                "database_name": MONGODB_DB_NAME,
-                "mongodb_connected": self.mongodb_connected # Added for health check
-            }
-        except Exception as e:
-            app.logger.error(f"Error getting database stats: {e}")
-            return {"error": str(e), "mongodb_connected": self.mongodb_connected}
+        """Get statistics about MongoDB and FAISS."""
+        mongo_stats = {"total_documents": 0, "database_name": MONGODB_DB_NAME, "mongodb_connected": self.mongodb_connected}
+        if self.mongodb_connected:
+            try:
+                mongo_stats["total_documents"] = self.documents_collection.count_documents({})
+            except Exception as e:
+                app.logger.error(f"Error getting MongoDB document count: {e}")
+                mongo_stats["error"] = "Failed to get document count from MongoDB."
+
+        faiss_stats = {"total_chunks_in_faiss": 0, "faiss_index_path": FAISS_INDEX_PATH, "embedding_dimension": getattr(self, 'embedding_dim', 'N/A')}
+        if self.vectorstore:
+             try:
+                 faiss_stats["total_chunks_in_faiss"] = self.vectorstore.index.ntotal if hasattr(self.vectorstore, 'index') else 'N/A'
+             except Exception as e:
+                 app.logger.error(f"Error getting FAISS index total: {e}")
+                 faiss_stats["error"] = "Failed to get FAISS index stats."
+
+
+        return {**mongo_stats, **faiss_stats} # Combine stats
 
 # --- Initialize KB globally ---
-kb = EnhancedRAGKnowledgeBase() 
-app.logger.info("✅ RAG Knowledge Base initialization attempted.") 
+# This uses the LangChain-based implementation
+kb = LangchainRAGKnowledgeBase()
+app.logger.info("✅ LangChain RAG Knowledge Base initialization attempted.")
+
 
 # --- PDF Processing Utility Function ---
 def extract_text_from_pdf(pdf_file) -> str:
@@ -620,6 +491,11 @@ def extract_text_from_pdf(pdf_file) -> str:
     text = ""
     try:
         reader = PyPDF2.PdfReader(pdf_file)
+        # Check if PDF is encrypted and if we can decrypt (requires password)
+        if reader.is_encrypted:
+             app.logger.warning("PDF is encrypted. Attempting decryption is not supported in this basic example.")
+             raise Exception("Encrypted PDFs are not supported.")
+
         for page_num in range(len(reader.pages)):
             page = reader.pages[page_num]
             text += page.extract_text() or ""
@@ -628,7 +504,7 @@ def extract_text_from_pdf(pdf_file) -> str:
         raise
     return text
 
-# --- Greeting and other conversational functions ---
+# --- Greeting and other conversational functions (Keep mostly as is) ---
 def get_time_based_greeting():
     current_hour = datetime.now().hour
     if 5 <= current_hour < 12:
@@ -659,8 +535,7 @@ def detect_greeting(text):
         "evening",
         "yo",
         "hola",
-        # Added phrases that might imply a request for help/action, leading to "How may I assist you?"
-        "what can you do", 
+        "what can you do",
         "how can you help",
         "how are you",
         "how's it going",
@@ -668,18 +543,14 @@ def detect_greeting(text):
         "need help",
         "assist me"
     ]
-    # Check if any greeting phrase is present in the text
     for greeting_phrase in greetings:
         if greeting_phrase in text_lower:
             return True
     return False
 
-
 def generate_greeting_response():
     time_greeting = get_time_based_greeting()
-    # Specifically generate the desired response
     return f"{time_greeting} How may I assist you? 😊"
-
 
 def detect_thanks(text):
     text_lower = text.lower().strip()
@@ -691,10 +562,6 @@ def detect_thanks(text):
         "appreciate it",
         "grateful",
         "cheers",
-        "awesome",
-        "perfect",
-        "great",
-        "helpful",
     ]
     if (
         any(phrase in text_lower for phrase in thanks_phrases)
@@ -702,7 +569,6 @@ def detect_thanks(text):
     ):
         return True
     return False
-
 
 def generate_thanks_response():
     responses = [
@@ -713,43 +579,16 @@ def generate_thanks_response():
     ]
     return random.choice(responses)
 
-# REMOVED: This function is no longer needed as its intent is covered by detect_greeting
-# def detect_help_request(text):
-#     text_lower = text.lower().strip()
-#     help_phrases = [
-#         "help",
-#         "what can you do",
-#         "how can you help",
-#         "capabilities",
-#         "assistance",
-#         "guide me",
-#     ]
-#     if any(phrase in text_lower for phrase in help_phrases):
-#         return True
-#     return False
-
-# REMOVED: This function is no longer needed as its intent is covered by generate_greeting_response
-# def generate_help_response():
-#     return (
-#         f"I'm an AI assistant using RAG with Gemini embeddings ({kb.model_name}) 🤖. "
-#         "I can answer questions based on my knowledge base about support, billing, passwords, or product features. Ask me anything!"
-#     )
-
-
 def enhanced_generate_response(
     question: str,
-    context_docs: List[str],
-    scores: List[float] = None,
+    rag_result: Dict[str, Any],
 ) -> str:
     question_lower = question.lower().strip()
 
-    if detect_greeting(question_lower): # This now handles all "greeting-like" initial contacts
+    if detect_greeting(question_lower):
         return generate_greeting_response()
     if detect_thanks(question_lower):
         return generate_thanks_response()
-    # REMOVED: No longer need this separate check as it's part of detect_greeting
-    # if detect_help_request(question_lower):
-    #     return generate_help_response()
 
     farewell_words = [
         "bye",
@@ -764,43 +603,39 @@ def enhanced_generate_response(
     if any(word in question_lower for word in farewell_words):
         return random.choice(["Goodbye! 👋", "See you later!", "Take care!"])
 
-    if not context_docs or not any(context_docs):
-        return "I couldn't find relevant information for your question. 🤔 Could you rephrase or ask about something else?"
+    # Check the answer from the LangChain RAG chain
+    answer = rag_result.get("answer", "").strip()
+    retrieved_docs = rag_result.get("retrieved_documents", [])
 
-    best_context = context_docs[0]
-    confidence_score = scores[0] if scores and scores[0] is not None else 0.0
+    # If the RAG chain produced a standard "not found" response or no relevant docs
+    # We check both the answer text and if any documents were actually retrieved
+    # LangChain's default prompt/chain might return "I couldn't find..." based on context
+    # Or it might return a generic answer if no *relevant* context was found by the retriever
+    if not retrieved_docs or answer.lower() in ["i couldn't find a direct answer based on the provided information.", ""]:
+         return "I couldn't find relevant information for your question. 🤔 Could you rephrase or ask about something else?"
 
-    # Gemini scores (cosine similarity) are typically 0.5-0.9 for relevant docs
-    confidence_emoji = (
-        "🎯" if confidence_score > 0.7 else "📈" if confidence_score > 0.55 else "💡"
-    )
+    # If we got a valid answer from the RAG chain based on retrieved docs
+    response_text = answer
 
-    # Use generate_answer_with_llm (Gemini)
-    if kb.gemini_generation_available and best_context and len(best_context.strip()) > 20:
-        generated_answer = kb.generate_answer_with_llm(question, best_context)
-        # Check if the LLM provided a meaningful answer
-        if generated_answer and generated_answer.strip().lower() not in ["i couldn't find a direct answer based on the provided information.", ""]:
-             return (
-                f"{confidence_emoji} Here's what I found:\n\n_{generated_answer}_\n\n"
-                f"Is this helpful? (Source relevance: {confidence_score:.2f})"
-            )
-        else:
-            # Fallback to just providing the context if LLM couldn't answer or gave a default response
-            app.logger.info("Gemini LLM couldn't generate a specific answer or returned a default response. Falling back to context.")
-            response_text = best_context
-            if len(response_text) > 700:
-                response_text = response_text[:700] + "..."
-            return (
-                f"{confidence_emoji} Based on my knowledge, here's some information:\n\n{response_text}\n\n"
-                f"Is this helpful? (Relevance: {confidence_score:.2f})"
-            )
+    # Optional: Append source information from retrieved docs
+    source_info = ""
+    if retrieved_docs:
+         unique_sources = set()
+         for doc in retrieved_docs:
+             # Assuming metadata contains original doc_id or source info
+             source_id = doc.get("metadata", {}).get("doc_id", "Unknown Source")
+             unique_sources.add(source_id)
+         if unique_sources:
+              source_info = "\n\nSources: " + ", ".join(unique_sources)
 
-    # Final fallback if no LLM or context too short
-    response_text = best_context
-    if len(response_text) > 700:
-        response_text = response_text[:700] + "..."
+    # LangChain RetrievalQA doesn't easily provide a single confidence score for the answer
+    # We can only rely on the fact that it used the top retrieved docs.
+    # Let's use a static emoji or one based on number of retrieved docs
+    confidence_emoji = "📚" if retrieved_docs else "💡"
+
+
     return (
-        f"{confidence_emoji}Here's some information:\n\n{response_text}\n\n" 
+        f"{confidence_emoji} {response_text}{source_info}\n\n"
         f"Is this helpful?"
     )
 
@@ -822,34 +657,20 @@ def handle_message(event):
         app.logger.info(f"Processing question from channel {channel}: '{text}'")
 
         # Check for conversational cues first
-        # This now handles all "greeting-like" initial contacts, and will trigger "How may I assist you?"
-        if (
-            detect_greeting(text)
-            or detect_thanks(text)
-            or any(
-                word in text.lower().strip()
-                for word in ["bye", "goodbye", "good night"]
-            )
-        ):
-            response = enhanced_generate_response(text, [], None) # Pass None for scores/doc_ids as they are not relevant here
+        if detect_greeting(text) or detect_thanks(text) or any(word in text.lower().strip() for word in ["bye", "goodbye", "good night"]):
+            # For conversational simple replies, no RAG result is needed for the enhanced_generate_response function
+            rag_result = {"answer": "", "retrieved_documents": []} # Pass empty result
+            response = enhanced_generate_response(text, rag_result)
         else:
-            # Ensure KB is ready before performing search
-            if not kb.mongodb_connected or not (GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GOOGLE_API_KEY_HERE"):
-                response = "Sorry, my knowledge base is not fully operational right now. Please check the server status."
+            # Check if RAG is ready
+            if not kb.langchain_ready:
+                 response = "Sorry, my knowledge base is not operational right now. Please check the server status and configuration (Gemini API, MongoDB, FAISS)."
             else:
-                search_results = kb.search(text, n_results=3, use_hybrid=True)
-                context_docs = search_results.get("documents", [])
-                scores = search_results.get("scores")
-                # doc_ids = search_results.get("ids") # Not directly used by enhanced_generate_response, can remove
-                if context_docs:
-                    app.logger.info(
-                        f"Found {len(context_docs)} relevant chunks. Top score: {scores[0] if scores else 'N/A'}"
-                    )
-                else:
-                    app.logger.info(f"No relevant documents found for query: '{text}'")
-                response = enhanced_generate_response(text, context_docs, scores)
+                # Use the LangChain RAG chain via kb.search_and_answer
+                rag_result = kb.search_and_answer(text)
+                response = enhanced_generate_response(text, rag_result)
 
-        if SLACK_BOT_TOKEN: # Ensure token is available before trying to post
+        if SLACK_BOT_TOKEN:
             slack_client.chat_postMessage(
                 channel=channel, text=response, thread_ts=event.get("ts")
             )
@@ -867,7 +688,7 @@ def handle_message(event):
             try:
                 slack_client.chat_postMessage(
                     channel=event.get("channel"),
-                    text="Sorry, an error occurred. 😅 Please try again.",
+                    text="Sorry, an internal error occurred while processing your request. 😅",
                     thread_ts=event.get("ts"),
                 )
             except Exception as slack_err:
@@ -875,8 +696,8 @@ def handle_message(event):
 
 
 # --- Flask Routes ---
-@app.route("/slack/events", methods=["POST"]) 
-def slack_events_route(): # Renamed to avoid confusion with the handler function
+@app.route("/slack/events", methods=["POST"])
+def slack_events_route():
     data = request.json
     if not data:
         return jsonify({"error": "No data"}), 400
@@ -886,15 +707,15 @@ def slack_events_route(): # Renamed to avoid confusion with the handler function
         event = data.get("event")
         if not event:
             return jsonify({"status": "ok", "message": "No event payload"}), 200
-        # Ignore messages from bots to prevent infinite loops
         if event.get("subtype") == "bot_message" or event.get("bot_id"):
             app.logger.info("Ignoring bot message.")
             return jsonify({"status": "ok", "message": "Ignored bot message"})
 
-        # Process app_mention or direct messages
         if event.get("type") == "app_mention" or (
             event.get("type") == "message" and event.get("channel_type") == "im"
         ):
+            # Run the event handling in a non-blocking way if possible in production
+            # For this example, sync is okay
             handle_message(event)
     return jsonify({"status": "ok"})
 
@@ -902,28 +723,33 @@ def slack_events_route(): # Renamed to avoid confusion with the handler function
 @app.route("/delete_knowledge/<doc_id>", methods=["DELETE"])
 def delete_knowledge(doc_id):
     try:
+        # Check if KB is ready enough for deletion
+        if not kb.mongodb_connected: # MongoDB is primary source of original docs
+             return jsonify({"error": "Knowledge base not ready: MongoDB not connected."}), 503
+
         success = kb.delete_document(doc_id)
         if success:
-            return jsonify({"status": "success", "message": f"Document '{doc_id}' deleted."})
+            return jsonify({"status": "success", "message": f"Document '{doc_id}' deleted from MongoDB and chunks removed from FAISS (via rebuild)."})
         else:
-            return jsonify({"error": "Document not found or deletion failed."}), 404
+            return jsonify({"error": "Document not found or deletion failed in MongoDB."}), 404
     except Exception as e:
-        app.logger.error(f"Error deleting knowledge: {e}")
+        app.logger.error(f"Error deleting knowledge: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 @app.route("/db_stats", methods=["GET"])
-def database_stats_route(): # Renamed to avoid clash if db_stats used internally
+def database_stats_route():
     try:
         stats = kb.get_database_stats()
-        if stats.get("error") and stats.get("mongodb_connected") is False: # Check specifically for mongo connection error
-             return jsonify({"status": "error", "message": stats["error"]}), 503 # Service Unavailable if MongoDB is down
-        elif stats.get("error"): # Other errors
-            return jsonify({"status": "error", "message": stats["error"]}), 500
-        return jsonify(stats)
-    except Exception as e:
-        app.logger.error(f"Error getting database stats via route: {e}")
-        return jsonify({"error": str(e)}), 500
+        # Check for critical errors in stats retrieval
+        if not stats.get("mongodb_connected"):
+            return jsonify({"status": "error", "message": stats.get("error", "MongoDB not connected.")}), 503
+        if stats.get("error") and stats.get("mongodb_connected"): # Other errors but MongoDB connected
+            return jsonify({"status": "warning", "message": stats.get("error", "Could not retrieve all stats.")}), 500 # Still return some stats if possible
 
+        return jsonify({"status": "success", "stats": stats})
+    except Exception as e:
+        app.logger.error(f"Error getting database stats via route: {e}", exc_info=True)
+        return jsonify({"status": "error", "message": f"An unexpected error occurred: {str(e)}"}), 500
 
 @app.route("/add_knowledge", methods=["POST"])
 def add_knowledge():
@@ -931,22 +757,24 @@ def add_knowledge():
         data = request.json
         if not data or not data.get("id") or not data.get("text"):
             return jsonify({"error": "Missing 'id' or 'text' in request body."}), 400
-        
-        # Ensure MongoDB is connected
+
+        # Check if KB is ready for adding
         if not kb.mongodb_connected:
-            return jsonify({"error": "Knowledge base not ready: MongoDB not connected."}), 503
-        
-        # Ensure Gemini API is configured
-        if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GOOGLE_API_KEY_HERE":
-            return jsonify({"error": "Knowledge base not ready: Gemini API key not configured."}), 503
+             return jsonify({"error": "Knowledge base not ready: MongoDB not connected."}), 503
+        if not kb.langchain_ready: # Includes Gemini/FAISS setup check
+             return jsonify({"error": "Knowledge base not ready: LangChain components (Gemini, FAISS) not initialized correctly. Check logs for API key or FAISS path issues."}), 503
 
         kb.add_document(data["id"], data["text"], data.get("metadata", {}))
         return jsonify(
             {
                 "status": "success",
-                "message": f"Document '{data['id']}' added/updated with Gemini embeddings.",
+                "message": f"Document '{data['id']}' added/updated in MongoDB and indexed in FAISS using Gemini embeddings.",
             }
         )
+    except (ConnectionError, RuntimeError) as e:
+        # Handle specific errors from kb.add_document indicating readiness issues
+        app.logger.error(f"KB readiness error adding knowledge: {e}")
+        return jsonify({"error": str(e)}), 503
     except Exception as e:
         app.logger.error(f"Error adding knowledge: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
@@ -956,54 +784,55 @@ def upload_pdf():
     try:
         if 'file' not in request.files:
             return jsonify({"error": "No file part"}), 400
-        
+
         file = request.files['file']
         if file.filename == '':
             return jsonify({"error": "No selected file"}), 400
-        
+
         if not file or not file.filename.lower().endswith('.pdf'):
             return jsonify({"error": "Invalid file type. Only PDF files are supported."}), 400
 
         doc_id = request.form.get('doc_id')
         if not doc_id:
-            # Generate a unique ID if not provided
             doc_id = f"pdf_{datetime.now().strftime('%Y%m%d%H%M%S')}_{random.randint(1000,9999)}"
-        
+
         metadata_str = request.form.get('metadata', '{}')
         try:
             metadata = json.loads(metadata_str)
         except json.JSONDecodeError:
-            metadata = {} # Default to empty if invalid JSON
+            metadata = {}
             app.logger.warning(f"Invalid metadata JSON provided for PDF upload: {metadata_str}")
 
         pdf_content = file.read()
         text = extract_text_from_pdf(io.BytesIO(pdf_content))
-        
+
         if not text.strip():
-            return jsonify({"error": "No text extracted from PDF. PDF might be image-based or empty."}), 400
-        
-        # Ensure KB is ready before attempting to add document
+            return jsonify({"error": "No text extracted from PDF. PDF might be image-based, encrypted, or empty."}), 400
+
+        # Check if KB is ready for adding
         if not kb.mongodb_connected:
-            return jsonify({"error": "Knowledge base not ready: MongoDB not connected."}), 503
-        if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GOOGLE_API_KEY_HERE":
-            return jsonify({"error": "Knowledge base not ready: Gemini API key not configured."}), 503
+             return jsonify({"error": "Knowledge base not ready: MongoDB not connected."}), 503
+        if not kb.langchain_ready: # Includes Gemini/FAISS setup check
+             return jsonify({"error": "Knowledge base not ready: LangChain components (Gemini, FAISS) not initialized correctly. Check logs for API key or FAISS path issues."}), 503
 
         kb.add_document(doc_id, text, metadata)
-        
+
         return jsonify({
             "status": "success",
-            "message": f"PDF '{file.filename}' processed and added as document '{doc_id}'.",
+            "message": f"PDF '{file.filename}' processed and added as document '{doc_id}' to MongoDB and indexed in FAISS.",
             "doc_id": doc_id,
             "extracted_text_preview": text[:200] + "..." if len(text) > 200 else text
         })
 
     except PyPDF2.errors.PdfReadError as e:
-        app.logger.error(f"PDF Read Error: {e}")
+        app.logger.error(f"PDF Read Error during upload: {e}")
         return jsonify({"error": f"Failed to read PDF: {e}. It might be corrupted or encrypted."}), 400
+    except (ConnectionError, RuntimeError) as e:
+        app.logger.error(f"KB readiness error uploading PDF: {e}")
+        return jsonify({"error": str(e)}), 503
     except Exception as e:
         app.logger.error(f"Error uploading PDF: {e}", exc_info=True)
         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
-
 
 @app.route("/test_search", methods=["POST"])
 def test_search():
@@ -1011,62 +840,34 @@ def test_search():
         data = request.json
         if not data or not data.get("query"):
             return jsonify({"error": "Missing query"}), 400
-        query, search_type, n_results = (
-            data["query"],
-            data.get("search_type", "hybrid").lower(),
-            data.get("n_results", 3),
-        )
+        query = data["query"]
+        # n_results, search_type are now handled by the RAG chain configuration, not explicit parameters here
 
-        # Ensure KB is ready before attempting search
-        if not kb.mongodb_connected or not (GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GOOGLE_API_KEY_HERE"):
-            return jsonify({"error": "Knowledge base not ready: MongoDB not connected or Gemini API key not configured."}), 503
+        # Check if KB is ready for search
+        if not kb.langchain_ready or kb.qa_chain is None:
+             return jsonify({"error": "Knowledge base not ready for search. LangChain RAG chain not initialized."}), 503
 
-        if search_type == "semantic":
-            results = kb.semantic_search(query, n_results)
-        elif search_type == "keyword":
-            results = kb.simple_keyword_search(query, n_results)
-        elif search_type == "hybrid":
-            results = kb.hybrid_search(query, n_results)
-        else:
-            return jsonify({"error": f"Invalid search_type: {search_type}"}), 400
+        rag_result = kb.search_and_answer(query)
 
-        formatted_results = []
-        if results and results.get("documents"):
-            for i in range(len(results["documents"])):
-                formatted_results.append(
-                    {
-                        "document": results["documents"][i],
-                        "score": (
-                            results["scores"][i]
-                            if "scores" in results and i < len(results["scores"])
-                            else None
-                        ),
-                        "id": (
-                            results["ids"][i]
-                            if "ids" in results and i < len(results["ids"])
-                            else None
-                        ),
-                        "metadata": (
-                            results["metadatas"][i]
-                            if "metadatas" in results and i < len(results["metadatas"])
-                            else {}
-                        ),
-                        "semantic_score": (
-                            results.get("semantic_scores", [])[i]
-                            if "semantic_scores" in results
-                            and i < len(results.get("semantic_scores", []))
-                            else None
-                        ),
-                        "keyword_score": (
-                            results.get("keyword_scores", [])[i]
-                            if "keyword_scores" in results
-                            and i < len(results.get("keyword_scores", []))
-                            else None
-                        ),
-                    }
-                )
+        # Format the retrieved documents nicely
+        retrieved_docs_formatted = []
+        for doc in rag_result.get("retrieved_documents", []):
+             retrieved_docs_formatted.append({
+                 "page_content": doc.page_content,
+                 "metadata": doc.metadata,
+                 # Scores are not directly available from RetrievalQA output
+                 # If scores are critical for this endpoint, we'd need to modify kb.search_and_answer
+                 # to call the retriever separately with score=True
+             })
+
         return jsonify(
-            {"query": query, "search_type": search_type, "results": formatted_results}
+            {
+                "query": query,
+                "answer": rag_result.get("answer"),
+                "retrieved_documents": retrieved_docs_formatted,
+                # "search_type": "RAG (LangChain RetrievalQA)", # Indicate the type
+                # "n_results_retrieved": len(retrieved_docs_formatted) # Can add retrieved count
+            }
         )
     except Exception as e:
         app.logger.error(f"Error in test_search: {e}", exc_info=True)
@@ -1077,15 +878,21 @@ def test_search():
 def list_knowledge():
     try:
         if not kb.mongodb_connected:
-            return jsonify({"error": "Knowledge base not ready: MongoDB not connected."}), 503
-            
+             return jsonify({"error": "Knowledge base not ready: MongoDB not connected."}), 503
+
         docs_summary = kb.get_all_documents()
+        
+        # Get FAISS index size if available
+        faiss_chunk_count = kb.vectorstore.index.ntotal if kb.vectorstore and hasattr(kb.vectorstore, 'index') else 0
+
+
         return jsonify(
             {
-                "total_documents": docs_summary["total_documents"], # Use the new total_documents field
-                "embedding_model": kb.model_name,
-                "vector_dimension": kb.embedding_dim,
-                "total_chunks_in_faiss": kb.index.ntotal if kb.index else 0,
+                "total_documents_in_db": docs_summary["total_documents"],
+                "total_chunks_in_faiss": faiss_chunk_count,
+                "embedding_model": getattr(kb, 'embeddings', None).__class__.__name__ if kb.embeddings else "Not Initialized",
+                "embedding_dimension": getattr(kb, 'embedding_dim', 'N/A'),
+                "llm_model": getattr(kb, 'llm', None).__class__.__name__ if kb.llm else "Not Initialized",
                 "documents": [
                     {
                         "id": docs_summary["ids"][i],
@@ -1103,82 +910,127 @@ def list_knowledge():
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    # Use the kb.mongodb_connected status directly
-    is_mongodb_connected = kb.mongodb_connected 
-    
-    db_stats = {}
-    if is_mongodb_connected:
-        try:
-            db_stats = kb.get_database_stats()
-        except Exception as e:
-            app.logger.error(f"Failed to get DB stats during health check: {e}")
-            db_stats = {"error": str(e)} # Indicate error in stats if it occurs during fetch
-            
-    # Check if a Gemini API key is set AND it's not the placeholder
-    gemini_configured = bool(
-        GEMINI_API_KEY
-        and GEMINI_API_KEY not in [
-            "YOUR_GOOGLE_API_KEY_HERE"
-        ]
-    )
+    # Check core dependencies
+    is_mongodb_connected = kb.mongodb_connected
+    is_gemini_key_configured = bool(GEMINI_API_KEY)
+    is_slack_token_configured = bool(SLACK_BOT_TOKEN)
+    is_langchain_ready = kb.langchain_ready
+
+    # Check state of LangChain components
+    embeddings_loaded = kb.embeddings is not None
+    llm_loaded = kb.llm is not None
+    vectorstore_loaded = kb.vectorstore is not None
+    retriever_loaded = kb.retriever is not None
+    qa_chain_loaded = kb.qa_chain is not None
+
+
+    # Get DB stats (handle potential errors)
+    db_stats = kb.get_database_stats()
+
+
+    overall_status = "healthy"
+    status_message = "All core components configured and initialized."
+
+    if not is_gemini_key_configured:
+        overall_status = "unhealthy"
+        status_message = "Gemini API key not configured."
+    elif not is_mongodb_connected:
+         overall_status = "unhealthy"
+         status_message = "MongoDB not connected."
+    elif not is_slack_token_configured:
+        overall_status = "warning" # Bot will run but not connect to Slack
+        status_message = "Slack bot token not configured."
+    elif not is_langchain_ready:
+         overall_status = "unhealthy"
+         status_message = "LangChain RAG components failed to initialize (check Gemini key or FAISS path)."
+    elif not vectorstore_loaded:
+         overall_status = "warning"
+         status_message = "FAISS vector store not yet initialized/loaded. Add documents to create it."
+    elif not qa_chain_loaded:
+         overall_status = "warning"
+         status_message = "LangChain QA chain not initialized (might be waiting for vector store)."
+
 
     return jsonify({
-        "status": "healthy" if is_mongodb_connected and gemini_configured else "unhealthy", # Overall status depends on critical components
-        "rag_enabled": is_mongodb_connected and gemini_configured,
-        "database_type": "MongoDB",
-        "database_name": MONGODB_DB_NAME,
-        "embedding_model": kb.model_name, # Access safely, though initialized in __init__
-        "vector_dimension": kb.embedding_dim, # Access safely
-        "total_documents_in_db": db_stats.get("total_documents", 0),
-        "total_chunks_in_db": db_stats.get("total_chunks", 0),
-        "total_chunks_in_faiss": kb.index.ntotal if kb.index else 0,
-        "qa_model_loaded": False, # Explicitly False as local models are removed
-        "gemini_generation_available": kb.gemini_generation_available, # New status for Gemini generation
-        "gemini_api_configured": gemini_configured,
-        "mongodb_connected": is_mongodb_connected,
-        "slack_bot_token_configured": bool(SLACK_BOT_TOKEN) # New check for Slack
+        "status": overall_status,
+        "message": status_message,
+        "dependencies": {
+            "mongodb_connected": is_mongodb_connected,
+            "gemini_api_key_configured": is_gemini_key_configured,
+            "slack_bot_token_configured": is_slack_token_configured,
+            "langchain_initialized": is_langchain_ready,
+        },
+        "rag_components": {
+            "embeddings_loaded": embeddings_loaded,
+            "llm_loaded": llm_loaded,
+            "vectorstore_loaded": vectorstore_loaded,
+            "retriever_loaded": retriever_loaded,
+            "qa_chain_loaded": qa_chain_loaded,
+        },
+        "database_stats": db_stats
     })
 
 
 @app.route("/")
 def home():
-    # Call get_all_documents once and extract total_documents
-    docs_info = kb.get_all_documents()
-    total_docs = docs_info["total_documents"] if kb.mongodb_connected else "N/A"
+    # Get stats for the home page display
+    stats = kb.get_database_stats()
     
-    total_chunks = kb.index.ntotal if kb.index and kb.mongodb_connected else "N/A"
-    qa_status = "✅ Using Gemini for Generation" if kb.gemini_generation_available else "❌ Generation Unavailable"
-    
-    gemini_ok_display = bool(
-        GEMINI_API_KEY
-        and GEMINI_API_KEY
-        not in ["YOUR_GOOGLE_API_KEY_HERE"]
-    )
-    
-    # Safely access kb.model_name, as it's set in __init__ with a default
-    model_name_display = getattr(kb, 'model_name', 'Unknown')
+    mongo_connected_display = stats.get("mongodb_connected", False)
+    gemini_api_display = bool(GEMINI_API_KEY)
+    slack_token_display = bool(SLACK_BOT_TOKEN)
+    langchain_ready_display = kb.langchain_ready
+    vectorstore_loaded_display = kb.vectorstore is not None
 
-    return f"""
-    <h1>🚀 RAG Slack AI Bot (Gemini Embeddings & Generation)</h1>
-    <p>Status: {'✅ Running' if kb.mongodb_connected and gemini_ok_display else '⚠️ Critical Configuration Issue!'}</p>
-    <h2>🔧 RAG Features:</h2>
-    <ul>
-        <li><strong>Embedding Service:</strong> Google Gemini ('{model_name_display}')</li>
-        <li><strong>Vector DB:</strong> FAISS (Inner Product for Cosine Similarity)</li>
-        <li><strong>Text Generation/QA:</strong> {'Google Gemini (' + kb.gemini_generation_model_id + ')' if kb.gemini_generation_available else 'Unavailable'}</li>
-    </ul>
-    <h2>📊 Stats:</h2>
-    <ul>
-        <li><strong>Embedding Model:</strong> {model_name_display} (Dim: {kb.embedding_dim})</li>
-        <li><strong>Total Docs in DB:</strong> {total_docs}</li>
-        <li><strong>Total Chunks in FAISS:</strong> {total_chunks}</li>
-        <li><strong>Text Generation Status:</strong> {qa_status}</li>
-        <li><strong>Gemini API Key:</strong> {'✅ Configured' if gemini_ok_display else '❌ NOT CONFIGURED OR PLACEHOLDER!'}</li>
-        <li><strong>MongoDB Connection:</strong> {'✅ Connected' if kb.mongodb_connected else '❌ NOT CONNECTED!'}</li>
-        <li><strong>Slack Token:</strong> {'✅ Configured' if SLACK_BOT_TOKEN else '❌ NOT CONFIGURED!'}</li>
-    </ul>
-    <p><em>See code/logs for API details. Remember to set GOOGLE_API_KEY, SLACK_BOT_TOKEN, and MONGODB_URI in your .env file.</em></p>
-    """
+    overall_status_display = "✅ Running"
+    if not gemini_api_display or not mongo_connected_display or not langchain_ready_display:
+        overall_status_display = "❌ Critical Configuration Issue!"
+    elif not slack_token_display:
+        overall_status_display = "⚠️ Slack Integration Issue!"
+    elif not vectorstore_loaded_display:
+         overall_status_display = "⚠️ FAISS Index Empty/Not Loaded!"
+
+
+    return render_template_string("""
+    <!doctype html>
+    <html>
+    <head><title>RAG Slack AI Bot Status</title></head>
+    <body>
+        <h1>🚀 RAG Slack AI Bot (LangChain + Gemini + FAISS)</h1>
+        <p>Status: {{ overall_status_display }}</p>
+        <h2>🔧 RAG Features:</h2>
+        <ul>
+            <li><strong>Framework:</strong> LangChain</li>
+            <li><strong>Embedding Service:</strong> Google Gemini ({{ stats.get('embedding_model', 'N/A') }})</li>
+            <li><strong>Vector DB:</strong> FAISS (Persistent at {{ stats.get('faiss_index_path', 'N/A') }})</li>
+            <li><strong>Text Generation/QA:</strong> Google Gemini ({{ getattr(kb, 'llm', None).model_name if getattr(kb, 'llm', None) else 'Not Initialized' }})</li>
+        </ul>
+        <h2>📊 Stats:</h2>
+        <ul>
+            <li><strong>Embedding Dimension:</strong> {{ stats.get('embedding_dimension', 'N/A') }}</li>
+            <li><strong>MongoDB Connection:</strong> {{ '✅ Connected' if stats.get('mongodb_connected', False) else '❌ NOT CONNECTED!' }}</li>
+            <li><strong>Database Name:</strong> {{ stats.get('database_name', 'N/A') }}</li>
+            <li><strong>Total Original Docs in DB:</strong> {{ stats.get('total_documents', 'N/A') }}</li>
+            <li><strong>FAISS Index Status:</strong> {{ '✅ Loaded' if vectorstore_loaded_display else '❌ Not Loaded/Empty' }}</li>
+            <li><strong>Total Chunks in FAISS Index:</strong> {{ stats.get('total_chunks_in_faiss', 'N/A') }}</li>
+            <li><strong>Gemini API Key:</strong> {{ '✅ Configured' if gemini_api_display else '❌ NOT CONFIGURED!' }}</li>
+            <li><strong>Slack Token:</strong> {{ '✅ Configured' if slack_token_display else '❌ NOT CONFIGURED!' }}</li>
+             <li><strong>LangChain Ready:</strong> {{ '✅ Yes' if langchain_ready_display else '❌ No' }}</li>
+        </ul>
+        <p><em>See code/logs for API details. Ensure GOOGLE_API_KEY, SLACK_BOT_TOKEN, and MONGODB_URI are set in your .env file. FAISS index persists to the specified path.</em></p>
+         <h3>Endpoints:</h3>
+        <ul>
+            <li><code>POST /add_knowledge</code> (json: {{"{ id: '...', text: '...', metadata: {{...}} }"}})</li>
+            <li><code>POST /upload_pdf</code> (form-data: file=@file.pdf, optional doc_id, metadata)</li>
+            <li><code>GET /list_knowledge</code></li>
+            <li><code>DELETE /delete_knowledge/<doc_id></code></li>
+            <li><code>POST /test_search</code> (json: {{"{ query: '...' }"}})</li>
+            <li><code>GET /db_stats</code></li>
+            <li><code>GET /health</code></li>
+        </ul>
+    </body>
+    </html>
+    """, overall_status_display=overall_status_display, stats=stats, kb=kb, vectorstore_loaded_display=vectorstore_loaded_display)
 
 
 # --- Sample Data Initialization ---
@@ -1211,111 +1063,146 @@ def initialize_sample_data():
         },
     ]
 
+    # Only attempt to initialize sample data if core dependencies are met
     if not kb.mongodb_connected:
         app.logger.warning("Skipping sample data initialization: MongoDB not connected.")
         return
+    if not kb.langchain_ready:
+         app.logger.warning("Skipping sample data initialization: LangChain RAG components not ready (Gemini API issue?).")
+         return
 
-    # Check if any documents already exist
-    existing_doc_count = kb.documents_collection.count_documents({})
-    
-    gemini_configured_for_embeddings = bool(
-        GEMINI_API_KEY
-        and GEMINI_API_KEY != "YOUR_GOOGLE_API_KEY_HERE"
-    )
+    try:
+        existing_doc_count = kb.documents_collection.count_documents({})
 
-    if existing_doc_count == 0 and gemini_configured_for_embeddings:
-        app.logger.info(
-            "🔄 Initializing RAG with sample data (using Gemini embeddings)..."
-        )
-        for doc in sample_docs:
-            try:
-                kb.add_document(
-                    doc["id"], doc["text"], doc.get("metadata", {})
-                )
-                app.logger.info(f"Successfully added sample document: {doc['id']}")
-            except Exception as e:
-                app.logger.error(f"Failed to add sample document {doc['id']}: {e}")
-        app.logger.info(
-            f"✅ Attempted to add {len(sample_docs)} sample docs. Current FAISS chunks: {kb.index.ntotal if kb.index else 'N/A'}"
-        )
-    elif existing_doc_count > 0:
-        app.logger.info(
-            f"📚 MongoDB already contains {existing_doc_count} documents. Skipping sample data initialization."
-        )
-        # Ensure FAISS index is loaded even if sample data was skipped but DB has data
-        if (kb.index is None or kb.index.ntotal == 0) and gemini_configured_for_embeddings:
-            app.logger.info("Attempting to load existing embeddings into FAISS as it seems empty...")
-            kb.load_existing_embeddings()
-    elif not gemini_configured_for_embeddings:
-        app.logger.warning(
-            "Skipping sample data initialization because Gemini API key is not properly configured."
-        )
+        # Check if the FAISS index directory exists and is not empty
+        faiss_exists = os.path.exists(FAISS_INDEX_PATH) and os.listdir(FAISS_INDEX_PATH)
+        
+        # Check if MongoDB has documents AND FAISS is not loaded/empty
+        if existing_doc_count > 0 and (kb.vectorstore is None or kb.vectorstore.index.ntotal == 0):
+             # This indicates a potential mismatch - docs in DB but not in index.
+             # In a real app, you might trigger a rebuild here.
+             # For this example, we'll warn and proceed.
+             app.logger.warning(f"MongoDB has {existing_doc_count} documents, but FAISS index is empty or not loaded. Index might be out of sync.")
+
+        # Add sample data only if MongoDB is empty AND FAISS is empty/not loaded
+        # This prevents adding duplicates or overwriting existing indexes unless empty.
+        if existing_doc_count == 0 and (kb.vectorstore is None or kb.vectorstore.index.ntotal == 0):
+            app.logger.info(
+                "🔄 Initializing RAG with sample data (using LangChain/Gemini/FAISS)..."
+            )
+            # Create a dummy document list for LangChain to process
+            lc_sample_docs = [
+                 Document(page_content=doc["text"], metadata={**(doc.get("metadata", {})), "doc_id": doc["id"]})
+                 for doc in sample_docs
+            ]
+            
+            # Use add_document method to store in MongoDB and add to FAISS
+            for doc in sample_docs:
+                 try:
+                      kb.add_document(doc["id"], doc["text"], doc.get("metadata", {}))
+                      app.logger.info(f"Successfully added sample document: {doc['id']}")
+                 except Exception as e:
+                      app.logger.error(f"Failed to add sample document {doc['id']}: {e}")
+
+
+            app.logger.info(
+                f"✅ Attempted to add {len(sample_docs)} sample docs. Current FAISS chunks: {kb.vectorstore.index.ntotal if kb.vectorstore and hasattr(kb.vectorstore, 'index') else 'N/A'}"
+            )
+        elif existing_doc_count > 0:
+            app.logger.info(
+                f"📚 MongoDB already contains {existing_doc_count} documents. Skipping sample data initialization."
+            )
+            # If DB has docs but FAISS wasn't loaded, kb.__init__ should have warned.
+            # The FAISS load happens in __init__. If it failed, kb.vectorstore might be None.
+            # We rely on __init__ to handle the initial load. If it failed, adding docs later will rebuild.
+
+        elif not faiss_exists and existing_doc_count == 0:
+             app.logger.info("MongoDB is empty and no existing FAISS index found. Sample data will be added if core KB components are ready.")
+             # Sample data will be added by the loop above if langhcain_ready was True
+
+        elif faiss_exists and kb.vectorstore is None:
+             app.logger.warning(f"FAISS index directory exists at {FAISS_INDEX_PATH}, but failed to load into LangChain. A new index might overwrite it on first add.")
+
+        else:
+             app.logger.info("FAISS index exists and/or MongoDB has documents. Skipping sample data load.")
+
+
+    except Exception as e:
+        app.logger.error(f"Error during sample data initialization: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
     )
-    app.logger.info("🚀 Starting RAG-Powered Slack AI Bot with Gemini Embeddings")
+    app.logger.info("🚀 Starting RAG-Powered Slack AI Bot with LangChain (Gemini + FAISS)")
 
-    # Re-evaluate critical configs for startup message
-    gemini_ok_startup = bool(
-        GEMINI_API_KEY
-        and GEMINI_API_KEY
-        not in ["YOUR_GOOGLE_API_KEY_HERE"]
-    )
+    # Check critical configs again for startup message clarity
+    gemini_ok_startup = bool(GEMINI_API_KEY)
     slack_ok_startup = bool(SLACK_BOT_TOKEN)
-    mongodb_ok_startup = kb.mongodb_connected # Check after KB initialization
+    mongodb_ok_startup = kb.mongodb_connected
+    langchain_ok_startup = kb.langchain_ready
 
     if not gemini_ok_startup:
         app.logger.critical(
-            "FATAL: Gemini API Key is not configured correctly. Embedding and generation will fail. Please set GOOGLE_API_KEY."
+            "FATAL: GOOGLE_API_KEY is not configured. Embedding and generation will fail. LangChain RAG is likely not initialized."
         )
     if not slack_ok_startup:
         app.logger.critical(
-            "FATAL: SLACK_BOT_TOKEN is not configured. Bot cannot connect to Slack. Please set SLACK_BOT_TOKEN."
+            "FATAL: SLACK_BOT_TOKEN is not configured. Bot cannot connect to Slack."
         )
     if not mongodb_ok_startup:
         app.logger.critical(
-            "FATAL: MongoDB is not connected. Knowledge base functionality will be severely limited. Please check MONGODB_URI."
+            "FATAL: MongoDB is not connected. Original documents cannot be stored/retrieved."
         )
+    if not langchain_ok_startup:
+         app.logger.critical(
+             "FATAL: LangChain RAG components failed to initialize. Check logs for specific errors (Gemini API key, FAISS path)."
+         )
 
-    # Initialize sample data only if core components are okay
-    if gemini_ok_startup and mongodb_ok_startup:
+
+    # Initialize sample data only if core components *needed for adding* are okay
+    # MongoDB is needed for original doc storage, LangChain/Gemini/FAISS is needed for indexing
+    if mongodb_ok_startup and langchain_ok_startup:
         initialize_sample_data()
     else:
         app.logger.warning(
-            "Skipping sample data initialization due to missing Gemini API key or MongoDB connection issues."
+            "Skipping sample data initialization due to critical configuration issues."
         )
 
-    app.logger.info("\n" + "=" * 80)
-    app.logger.info("🎯 Gemini RAG Bot is ready (or attempting to be)!")
 
-    # Access model_name safely for the startup logs
-    model_name_for_log = getattr(kb, 'model_name', 'Unknown')
-    gemini_gen_model_for_log = getattr(kb, 'gemini_generation_model_id', 'Unknown')
-    gemini_gen_status = 'Gemini (' + gemini_gen_model_for_log + ')' if getattr(kb, 'gemini_generation_available', False) else 'Not available'
+    app.logger.info("\n" + "=" * 80)
+    app.logger.info("🎯 LangChain RAG Bot is ready (or attempting to be)!")
+
+    # Access components safely for logging
+    embedding_model_name = getattr(getattr(kb, 'embeddings', None), 'model_name', 'Not Initialized')
+    llm_model_name = getattr(getattr(kb, 'llm', None), 'model_name', 'Not Initialized')
+    vectorstore_status = "✅ Loaded" if kb.vectorstore is not None else "❌ Not Loaded/Empty"
+
 
     app.logger.info(
-        f"   • Embeddings by: Google Gemini ('{model_name_for_log}') {'✅' if gemini_ok_startup else '❌ (KEY ISSUE!)'}"
+        f"   • Embeddings by: Google Gemini ('{embedding_model_name}') {'✅' if gemini_ok_startup else '❌ (KEY ISSUE!)'}"
     )
     app.logger.info(
-        f"   • Slack Integration: {'✅' if slack_ok_startup else '❌ (TOKEN ISSUE!)'}"
+        f"   • Text Generation (QA): Google Gemini ('{llm_model_name}') {'✅' if getattr(kb, 'llm', None) else '❌ (ISSUE!)'}"
+    )
+    app.logger.info(
+        f"   • Vector Store (FAISS): {vectorstore_status}"
     )
     app.logger.info(
         f"   • MongoDB Connection: {'✅' if mongodb_ok_startup else '❌ (CONNECTION ISSUE!)'}"
     )
     app.logger.info(
-        f"   • Text Generation (QA): {gemini_gen_status}"
+        f"   • Slack Integration: {'✅' if slack_ok_startup else '❌ (TOKEN ISSUE!)'}"
     )
     app.logger.info(
         f"🌐 Web interface: http://localhost:{os.environ.get('PORT', 3000)}"
     )
     app.logger.info("=" * 80 + "\n")
 
-    if not gemini_ok_startup or not slack_ok_startup or not mongodb_ok_startup:
+    if not gemini_ok_startup or not slack_ok_startup or not mongodb_ok_startup or not langchain_ok_startup:
         app.logger.warning(
-            "CRITICAL CONFIGURATION ISSUES DETECTED. BOT MAY NOT FUNCTION CORRECTLY."
+            "CRITICAL CONFIGURATION ISSUES DETECTED. BOT MAY NOT FUNCTION CORRECTLY. Check logs above."
         )
 
     port = int(os.environ.get("PORT", 3000))

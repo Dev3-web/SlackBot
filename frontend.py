@@ -56,7 +56,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Configuration
-DEFAULT_API_URL = "http://localhost:3000"
+DEFAULT_API_URL = "https://slackbot-2-wl4y.onrender.com"
 
 # Initialize session state
 if 'api_url' not in st.session_state:

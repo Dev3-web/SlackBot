@@ -94,7 +94,8 @@ class EnhancedRAGKnowledgeBase:
 
         # MongoDB setup
         try:
-            self.mongo_client = MongoClient(MONGODB_URI)
+            # FIX: Added a serverSelectionTimeoutMS to fail faster if MongoDB is unavailable.
+            self.mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
             self.db = self.mongo_client[MONGODB_DB_NAME]
             self.documents_collection = self.db.documents
             self.chunks_collection = self.db.document_chunks

@@ -25,7 +25,7 @@ from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain_core.documents import Document
-from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_community.tools import DuckDuckGoSearchRun # Keep import, but won't be used in slack handler
 from langchain_core.output_parsers import StrOutputParser # Helpful for chains
 
 # Load environment variables from .env file
@@ -47,6 +47,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Primary API Key for LLM and 
 llm = None
 embeddings = None
 openai_available = False
+FAISS_EMBEDDING_DIMENSION = 1536 # Default/fallback dimension
 
 if not OPENAI_API_KEY:
     app.logger.critical(
@@ -68,24 +69,17 @@ else:
             if len(dummy_embedding) > 0:
                  app.logger.info(f"OpenAI embedding model seems functional (dim: {len(dummy_embedding)}).")
                  openai_available = True
-                 # Update embedding dimension based on the model response
-                 # text-embedding-ada-002 is 1536, text-embedding-3-small is 1536, text-embedding-3-large is 3072
-                 # Let's assume text-embedding-ada-002 for simplicity unless specified
-                 # The actual dimension is returned by the API call
-                 FAISS_EMBEDDING_DIMENSION = len(dummy_embedding)
+                 FAISS_EMBEDDING_DIMENSION = len(dummy_embedding) # Set dimension based on test call
             else:
                  app.logger.error("OpenAI embedding model returned empty embedding.")
                  openai_available = False
-                 FAISS_EMBEDDING_DIMENSION = 1536 # Default/fallback
         except Exception as e:
             app.logger.critical(f"Failed to test OpenAI embedding model: {e}. OpenAI features disabled.")
             openai_available = False
-            FAISS_EMBEDDING_DIMENSION = 1536 # Default/fallback
 
     except Exception as e:
         app.logger.critical(f"Failed to initialize OpenAI LLM or Embeddings: {e}. Please check your key and model names.")
         openai_available = False
-        FAISS_EMBEDDING_DIMENSION = 1536 # Default/fallback
 
 
 # Initialize Slack client
@@ -96,6 +90,7 @@ if not SLACK_BOT_TOKEN:
 slack_client = WebClient(token=SLACK_BOT_TOKEN or "dummy_token") # Use dummy if none to avoid crash, but warn
 
 # Initialize External Search Tool (from langchain-community)
+# Keep initialized, but it won't be used in the Slack handler in this version
 search_tool = None
 try:
     search_tool = DuckDuckGoSearchRun()
@@ -255,8 +250,7 @@ class LangChainRAGKnowledgeBase:
     def chunk_text(self, text: str, chunk_size: int = 500, chunk_overlap: int = 50) -> List[Document]:
         """
         Splits text into chunks using LangChain's TextSplitter logic (simulated)
-        and returns LangChain Document objects.
-        This custom version directly prepares Documents for FAISS.
+         and returns a list of chunk strings.
         """
         if not text or len(text.strip()) == 0:
             return []
@@ -286,8 +280,7 @@ class LangChainRAGKnowledgeBase:
 
             chunk_text_content = text[last_idx:split_point].strip()
             if chunk_text_content:
-                # Note: We don't add metadata like original doc_id/chunk_index here.
-                # That's added when creating the final Document objects *after* chunking.
+                # Note: We return list of strings here. Document objects are created later.
                 chunks.append(chunk_text_content)
 
             if split_point >= len(text): # Reached end of text
@@ -490,7 +483,8 @@ class LangChainRAGKnowledgeBase:
             "total_documents_in_db": 0,
             "total_chunks_in_db": 0,
             "faiss_index_size": 0, # Number of vectors in FAISS
-            "embedding_dimension": self.embeddings.client.embeddings[0].embedding_dimensions if self.embeddings and hasattr(self.embeddings, 'client') and hasattr(self.embeddings.client, 'embeddings') and self.embeddings.client.embeddings else FAISS_EMBEDDING_DIMENSION,
+            # Attempt to get actual dimension from embeddings if available
+            "embedding_dimension": getattr(self.embeddings, 'embedding_ctx_length', FAISS_EMBEDDING_DIMENSION) if self.embeddings else FAISS_EMBEDDING_DIMENSION,
             "error": None
         }
         
@@ -501,7 +495,7 @@ class LangChainRAGKnowledgeBase:
         try:
             stats["total_documents_in_db"] = self.documents_collection.count_documents({})
             stats["total_chunks_in_db"] = self.chunks_collection.count_documents({})
-            stats["faiss_index_size"] = self.vectorstore.index.ntotal if self.vectorstore and self.vectorstore.index else 0
+            stats["faiss_index_size"] = self.vectorstore.index.ntotal if self.vectorstore and hasattr(self.vectorstore, 'index') and hasattr(self.vectorstore.index, 'ntotal') else 0
             
         except Exception as e:
             app.logger.error(f"Error getting database stats: {e}")
@@ -521,9 +515,8 @@ else:
 
 # --- Setup LangChain RAG Chain ---
 rag_chain = None
-if llm and kb and kb.vectorstore:
-    # Define the RAG prompt template
-    rag_prompt_template = """You are a helpful AI assistant. Answer the following question based *only* on the provided context. 
+# Define the RAG prompt template (moved outside the if block so it's defined even if chain init fails)
+rag_prompt_template = """You are a helpful AI assistant. Answer the following question based *only* on the provided context. 
 If the context doesn't contain enough information to answer the question, say so politely and state that you couldn't find the information in your knowledge base. Do not make up information.
 
 Context:
@@ -532,25 +525,28 @@ Context:
 Question: {question}
 
 Answer:"""
-    RAG_PROMPT = PromptTemplate(template=rag_prompt_template, input_variables=["context", "question"])
+RAG_PROMPT = PromptTemplate(template=rag_prompt_template, input_variables=["context", "question"])
 
-    # Create RetrievalQA chain
-    # Uses 'stuff' chain type by default, which puts all retrieved docs in context
-    # Get retriever from the initialized vectorstore
-    retriever = kb.get_retriever(search_kwargs={"k": 5}) # Retrieve top 5 documents for RAG context
+if llm and kb and kb.vectorstore:
+    try:
+        # Get retriever from the initialized vectorstore
+        retriever = kb.get_retriever(search_kwargs={"k": 5}) # Retrieve top 5 documents for RAG context
 
-    if retriever:
-        rag_chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",
-            retriever=retriever,
-            chain_type_kwargs={"prompt": RAG_PROMPT},
-            return_source_documents=False, # Set to True if you want source docs in the output
-        )
-        app.logger.info("✅ LangChain RetrievalQA chain initialized.")
-    else:
-        app.logger.critical("❌ Failed to get retriever from vectorstore. RAG chain not initialized.")
-        rag_chain = None # Ensure it's None if retriever failed
+        if retriever:
+            rag_chain = RetrievalQA.from_chain_type(
+                llm=llm,
+                chain_type="stuff",
+                retriever=retriever,
+                chain_type_kwargs={"prompt": RAG_PROMPT},
+                return_source_documents=False, # Set to True if you want source docs in the output
+            )
+            app.logger.info("✅ LangChain RetrievalQA chain initialized.")
+        else:
+            app.logger.critical("❌ Failed to get retriever from vectorstore. RAG chain not initialized.")
+            rag_chain = None # Ensure it's None if retriever failed
+    except Exception as e:
+         app.logger.critical(f"❌ Error initializing LangChain RetrievalQA chain: {e}. Chain not initialized.")
+         rag_chain = None
 else:
      app.logger.critical("❌ LangChain RetrievalQA chain initialization skipped due to missing LLM, KB, or Vectorstore.")
 
@@ -582,7 +578,7 @@ def extract_text_from_pdf(pdf_file) -> str:
         raise
     return text.strip() # Return stripped text
 
-# --- External Search Result Parsing ---
+# --- External Search Result Parsing (Keep utility functions, but they won't be used in handle_message) ---
 def parse_duckduckgo_search_results(raw_results: str, max_links_per_type: int = 3, video_site_filter: str = "youtube.com") -> Dict[str, List[Dict]]:
     """
     Parses raw search results string from DuckDuckGoSearchRun into formatted links,
@@ -592,44 +588,34 @@ def parse_duckduckgo_search_results(raw_results: str, max_links_per_type: int = 
     if not raw_results or not isinstance(raw_results, str):
         return results
 
-    # DuckDuckGoSearchRun output format can vary, often comma-separated entries
-    # or simple list-like format. This parsing is heuristic.
-    # Example: "[snippet title: link, snippet title: link]" or "snippet title: link\nsnippet title: link"
-    
-    # Split by common separators like comma or newline followed by a potential title/link pattern
-    entries = re.split(r',\s*(?=\w+: http)', raw_results) # Split by comma followed by title: http
-    if len(entries) <= 1: # If comma split didn't work well, try splitting by newline
+    entries = re.split(r',\s*(?=\w+: http)', raw_results)
+    if len(entries) <= 1:
          entries = raw_results.strip().split('\n')
 
-    link_pattern = r'http[s]?://(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?:/[^\s]*)?' # More specific URL pattern
+    link_pattern = r'http[s]?://(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?:/[^\s]*)?' 
 
     for entry in entries:
         entry = entry.strip()
         if not entry:
             continue
 
-        match = re.search(rf'(.*):\s*({link_pattern})', entry) # Look for "Title: URL" pattern
+        match = re.search(rf'(.*):\s*({link_pattern})', entry)
         
         if match:
             title = match.group(1).strip()
             link = match.group(2).strip()
             
-            # Basic cleaning of title (remove leading "[", trailing ",")
             title = title.lstrip('["').rstrip(',"]') 
 
-            # Check if it's a video link (e.g., YouTube)
             if video_site_filter.lower() in link.lower() and len(results['videos']) < max_links_per_type:
                 results['videos'].append({"title": title or "Video Link", "url": link})
-            # Otherwise, add as a general web link
             elif len(results['web']) < max_links_per_type:
                  results['web'].append({"title": title or "Web Link", "url": link})
 
         else:
-             # If "Title: URL" pattern not found, just try to find a raw URL
              urls = re.findall(link_pattern, entry)
              if urls:
                  link = urls[0]
-                 # Use a snippet of the text as a fallback title
                  title = entry.replace(link, "").strip()[:50] + "..." if len(entry.replace(link, "").strip()) > 50 else entry.replace(link, "").strip() or f"Link {len(results['web']) + len(results['videos']) + 1}"
 
                  if video_site_filter.lower() in link.lower() and len(results['videos']) < max_links_per_type:
@@ -637,8 +623,24 @@ def parse_duckduckgo_search_results(raw_results: str, max_links_per_type: int = 
                  elif len(results['web']) < max_links_per_type:
                      results['web'].append({"title": title or "Web Link", "url": link})
 
-
     return results
+
+def format_search_results_for_slack(search_results: Dict[str, List[Dict]]) -> str:
+    """Formats parsed DuckDuckGo search results into a Slack-friendly string."""
+    output = []
+    if search_results.get("web"):
+        output.append("*Relevant Web Links:*")
+        for item in search_results["web"]:
+            output.append(f"• <{item['url']}|{item['title']}>")
+
+    if search_results.get("videos"):
+        output.append("\n*Relevant Videos:*")
+        for item in search_results["videos"]:
+             icon = ":youtube:" if "youtube.com" in item['url'].lower() else ""
+             output.append(f"• {icon} <{item['url']}|{item['title']}>")
+
+    return "\n".join(output)
+
 
 # --- Conversational Helpers ---
 def get_time_based_greeting():
@@ -657,13 +659,10 @@ def detect_greeting(text):
     greetings = [
         "hello", "hi", "hey", "hiya", "howdy", "sup", "what's up", 
         "good morning", "morning", "good afternoon", "afternoon", 
-        "good evening", "evening", "yo", "hola", "namaste" # Added more
+        "good evening", "evening", "yo", "hola", "namaste"
     ]
-    # Check if the text *starts with or primarily consists of* a greeting
-    # Avoid matching greetings within a question like "Hello, what is X?" vs "Hello"
     if any(text_lower == g for g in greetings):
          return True
-    # Also check if the text contains a greeting and is relatively short (e.g., just a greeting + maybe a question mark)
     if len(text_lower.split()) <= 3 and any(g in text_lower for g in greetings):
          return True
     return False
@@ -679,7 +678,7 @@ def detect_thanks(text):
     ]
     if (
         any(phrase in text_lower for phrase in thanks_phrases)
-        and not "no thanks" in text_lower # Exclude "no thanks"
+        and not "no thanks" in text_lower
     ):
         return True
     return False
@@ -705,24 +704,6 @@ def detect_farewell(text):
 
 def generate_farewell_response():
      return random.choice(["Goodbye! 👋", "See you later!", "Take care!", "Bye for now!"])
-
-
-def format_search_results_for_slack(search_results: Dict[str, List[Dict]]) -> str:
-    """Formats parsed DuckDuckGo search results into a Slack-friendly string."""
-    output = []
-    if search_results.get("web"):
-        output.append("*Relevant Web Links:*")
-        for item in search_results["web"]:
-            output.append(f"• <{item['url']}|{item['title']}>")
-
-    if search_results.get("videos"):
-        output.append("\n*Relevant Videos:*")
-        for item in search_results["videos"]:
-             # Add a YouTube icon if the link is from YouTube
-             icon = ":youtube:" if "youtube.com" in item['url'].lower() else ""
-             output.append(f"• {icon} <{item['url']}|{item['title']}>")
-
-    return "\n".join(output)
 
 
 # --- Slack event handling ---
@@ -772,11 +753,11 @@ def handle_message(event):
              response_text = (
                 f"I am an AI assistant powered by OpenAI embeddings and generation. "
                 f"My knowledge base is stored in MongoDB ({MONGODB_DB_NAME}) and indexed using FAISS. "
-                "I can answer questions based on the documents I've been trained on, and I can also search the web for links and videos."
-                "\n\nAsk me about topics covered in the knowledge base, or just ask a general question."
+                "I can answer questions based on the documents I've been trained on."
+                "\n\nAsk me about topics covered in the knowledge base."
             )
         else:
-             # --- Handle RAG and External Search ---
+             # --- Handle RAG Only (External search removed from this path) ---
              # Ensure KB and RAG chain are available
              if not kb or not kb.mongodb_connected or not openai_available or not rag_chain:
                 response_text = "Sorry, my core RAG system is not fully operational right now. Please check the server status."
@@ -787,39 +768,18 @@ def handle_message(event):
                     app.logger.info(f"Invoking RAG chain for query: '{text}'")
                     # The RetrievalQA chain handles retrieval and generation internally
                     rag_response_obj = rag_chain.invoke({"query": text})
+                    
+                    # Extract the answer
                     rag_answer = rag_response_obj.get('result', "I couldn't find relevant information in my knowledge base to answer that.")
 
-                    # Perform external search using the tool
-                    external_search_links = ""
-                    if search_tool:
-                        try:
-                            app.logger.info(f"Performing external search for: {text}")
-                            # Perform two searches: one general, one targeted at videos
-                            general_search_raw = search_tool.run(f"{text} links")
-                            video_search_raw = search_tool.run(f"site:youtube.com {text}")
+                    # The response is now ONLY the RAG answer
+                    response_text = rag_answer
 
-                            # Combine and parse results
-                            combined_raw_results = general_search_raw + "\n" + video_search_raw
-                            parsed_external_results = parse_duckduckgo_search_results(combined_raw_results, max_links_per_type=3)
-
-                            external_search_links = format_search_results_for_slack(parsed_external_results)
-
-                        except Exception as search_error:
-                            app.logger.error(f"Error during external search: {search_error}")
-                            external_search_links = "\n\n_Error fetching external links._"
-                    else:
-                         external_search_links = "\n\n_External search tool not available._"
-
-
-                    # Combine RAG answer and external links
-                    response_text = f"{rag_answer}"
-                    if external_search_links.strip(): # Only add if there are links
-                         response_text += f"\n\n---\n{external_search_links}"
-
+                    # External search logic that was here is REMOVED.
 
                 except Exception as rag_error:
-                    app.logger.error(f"Error during RAG or external search process: {rag_error}", exc_info=True)
-                    response_text = "Sorry, I encountered an error while trying to find or generate information. Please try again."
+                    app.logger.error(f"Error during RAG process: {rag_error}", exc_info=True)
+                    response_text = "Sorry, I encountered an error while trying to find or generate information from my knowledge base. Please try again."
 
 
         # Send response to Slack
@@ -937,23 +897,25 @@ def add_knowledge_route():
         # Re-initialize RAG chain if KB or vectorstore was just created/rebuilt
         global rag_chain
         if llm and kb and kb.vectorstore:
-             if not rag_chain: # Only create if it was None before
-                  try:
-                      retriever = kb.get_retriever(search_kwargs={"k": 5})
-                      if retriever:
-                          RAG_PROMPT = PromptTemplate(template=rag_prompt_template, input_variables=["context", "question"])
-                          rag_chain = RetrievalQA.from_chain_type(
-                              llm=llm,
-                              chain_type="stuff",
-                              retriever=retriever,
-                              chain_type_kwargs={"prompt": RAG_PROMPT},
-                              return_source_documents=False,
-                          )
-                          app.logger.info("✅ RAG chain re-initialized after adding document.")
-                      else:
-                           app.logger.error("Failed to get retriever after adding document. RAG chain not re-initialized.")
-                  except Exception as chain_init_e:
-                      app.logger.error(f"Error re-initializing RAG chain after adding document: {chain_init_e}")
+             # Always attempt to re-initialize to pick up the new vectorstore instance
+             try:
+                 retriever = kb.get_retriever(search_kwargs={"k": 5})
+                 if retriever:
+                     # Use the defined RAG_PROMPT
+                     rag_chain = RetrievalQA.from_chain_type(
+                         llm=llm,
+                         chain_type="stuff",
+                         retriever=retriever,
+                         chain_type_kwargs={"prompt": RAG_PROMPT},
+                         return_source_documents=False,
+                     )
+                     app.logger.info("✅ RAG chain re-initialized after adding document.")
+                 else:
+                      app.logger.error("Failed to get retriever after adding document. RAG chain not re-initialized.")
+                      rag_chain = None
+             except Exception as chain_init_e:
+                 app.logger.error(f"Error re-initializing RAG chain after adding document: {chain_init_e}")
+                 rag_chain = None # Set to None on error
 
 
         return jsonify(
@@ -967,7 +929,7 @@ def add_knowledge_route():
         # Return more specific error if it's a known issue like MongoDB connection or API key
         if isinstance(e, ConnectionFailure):
              return jsonify({"error": f"Database connection error: {str(e)}"}), 503
-        if "OpenAI API not available" in str(e):
+        if "OpenAI API not available" in str(e) or not openai_available:
              return jsonify({"error": f"OpenAI API not available: {str(e)}"}), 503
         return jsonify({"error": str(e)}), 500
 
@@ -1031,23 +993,25 @@ def upload_pdf_route():
         # Re-initialize RAG chain if KB or vectorstore was just created/rebuilt
         global rag_chain
         if llm and kb and kb.vectorstore:
-             if not rag_chain: # Only create if it was None before
-                  try:
-                      retriever = kb.get_retriever(search_kwargs={"k": 5})
-                      if retriever:
-                          RAG_PROMPT = PromptTemplate(template=rag_prompt_template, input_variables=["context", "question"])
-                          rag_chain = RetrievalQA.from_chain_type(
-                              llm=llm,
-                              chain_type="stuff",
-                              retriever=retriever,
-                              chain_type_kwargs={"prompt": RAG_PROMPT},
-                              return_source_documents=False,
-                          )
-                          app.logger.info("✅ RAG chain re-initialized after adding document.")
-                      else:
-                           app.logger.error("Failed to get retriever after adding document. RAG chain not re-initialized.")
-                  except Exception as chain_init_e:
-                      app.logger.error(f"Error re-initializing RAG chain after adding document: {chain_init_e}")
+             # Always attempt to re-initialize to pick up the new vectorstore instance
+             try:
+                 retriever = kb.get_retriever(search_kwargs={"k": 5})
+                 if retriever:
+                     # Use the defined RAG_PROMPT
+                     rag_chain = RetrievalQA.from_chain_type(
+                         llm=llm,
+                         chain_type="stuff",
+                         retriever=retriever,
+                         chain_type_kwargs={"prompt": RAG_PROMPT},
+                         return_source_documents=False,
+                     )
+                     app.logger.info("✅ RAG chain re-initialized after adding document.")
+                 else:
+                      app.logger.error("Failed to get retriever after adding document. RAG chain not re-initialized.")
+                      rag_chain = None
+             except Exception as chain_init_e:
+                 app.logger.error(f"Error re-initializing RAG chain after adding document: {chain_init_e}")
+                 rag_chain = None # Set to None on error
 
         
         return jsonify({
@@ -1068,7 +1032,7 @@ def upload_pdf_route():
         # Return more specific error if it's a known issue like MongoDB connection or API key
         if isinstance(e, ConnectionFailure):
              return jsonify({"error": f"Database connection error: {str(e)}"}), 503
-        if "OpenAI API not available" in str(e):
+        if "OpenAI API not available" in str(e) or not openai_available:
              return jsonify({"error": f"OpenAI API not available: {str(e)}"}), 503
         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
@@ -1092,7 +1056,7 @@ def delete_knowledge_route(doc_id):
                 try:
                     retriever = kb.get_retriever(search_kwargs={"k": 5})
                     if retriever:
-                        RAG_PROMPT = PromptTemplate(template=rag_prompt_template, input_variables=["context", "question"])
+                        # Use the defined RAG_PROMPT
                         rag_chain = RetrievalQA.from_chain_type(
                             llm=llm,
                             chain_type="stuff",
@@ -1118,7 +1082,7 @@ def delete_knowledge_route(doc_id):
         app.logger.error(f"Error deleting knowledge: {e}", exc_info=True)
         if isinstance(e, ConnectionFailure):
              return jsonify({"error": f"Database connection error: {str(e)}"}), 503
-        if "OpenAI API not available" in str(e):
+        if "OpenAI API not available" in str(e) or not openai_available:
              return jsonify({"error": f"OpenAI API not available: {str(e)}"}), 503
         return jsonify({"error": str(e)}), 500
 
@@ -1191,40 +1155,28 @@ def test_search_route():
 @app.route("/test_rag_gen", methods=["POST"])
 def test_rag_gen_route():
     """Endpoint to test RAG generation with provided context and question using the RAG chain."""
+    # Note: This route allows testing the RAG chain's end-to-end flow or testing the LLM
+    # with user-provided context. It does *not* use the external search tool.
     try:
         data = request.json
-        if not data or not data.get("question") or not data.get("context"):
-            # User can provide context directly for testing the LLM part
-            # Or they can rely on the chain's retrieval if context is missing
-            # Let's make context optional for this test route, if missing, it performs retrieval first
-            question = data.get("question")
-            provided_context = data.get("context")
+        question = data.get("question")
+        provided_context = data.get("context") # Optional
 
-            if not question:
-                 return jsonify({"error": "Missing 'question' in request body."}), 400
+        if not question:
+             return jsonify({"error": "Missing 'question' in request body."}), 400
 
         app.logger.info(f"Received test RAG gen request: question='{question[:50]}...'")
 
-        # Ensure RAG chain is available
-        if not rag_chain:
-             return jsonify({"error": "RAG Generation chain not initialized. Check OpenAI API, MongoDB, and FAISS index status."}), 503
+        # Ensure LLM is available for generation
+        if not llm or not openai_available:
+             return jsonify({"error": "OpenAI LLM not available. Cannot perform generation."}), 503
+
 
         try:
-            # If context is provided, use it directly in the chain's LLM call
-            # If not provided, the chain will perform retrieval based on the question
             if provided_context:
-                 # This mimics the stuffing process, but with user-provided context
-                 # We can't directly inject context into the RetrievalQA chain's internal LLM call easily
-                 # A better approach is to bypass the retriever and call the LLM with a custom prompt
-                 # Or, just require context for this test route
-                 
-                 # Let's refine the route: require question and context to test the LLM generation based on *given* context.
-                 # To test retrieval + generation, use the handle_message flow or a dedicated endpoint.
-                 
-                 # Use the base LLM with a RAG-like prompt
-                 if not llm:
-                      return jsonify({"error": "OpenAI LLM not initialized."}), 503
-
+                 # Test the LLM generation based on *provided* context
+                 app.logger.info("Testing RAG generation with provided context.")
+                 # Use the base LLM with a RAG-like prompt template
                  rag_prompt_template_llm = """You are a helpful AI assistant. Answer the following question based *only* on the provided context. 
 If the context doesn't contain enough information to answer the question, say so politely and state that you couldn't find the information in the context. Do not make up information.
 
@@ -1236,7 +1188,6 @@ Question: {question}
 Answer:"""
                  prompt = PromptTemplate(template=rag_prompt_template_llm, input_variables=["context", "question"]).format(context=provided_context, question=question)
 
-                 # Use LLM directly
                  response = llm.invoke(prompt)
                  generated_answer = response.content.strip() # Use .content for BaseMessage
 
@@ -1244,16 +1195,20 @@ Answer:"""
                  return jsonify({
                     "question": question,
                     "context_preview": provided_context[:200] + "..." if len(provided_context) > 200 else provided_context,
-                    "generated_answer": generated_answer
+                    "generated_answer": generated_answer,
+                    "mode": "generation_with_provided_context"
                  })
 
             else:
-                 # If no context provided, use the RAG chain to test retrieval + generation end-to-end
-                 app.logger.info(f"Performing retrieval + generation test for query: '{question}'")
+                 # Test the full RAG chain (retrieval + generation)
+                 app.logger.info(f"Testing full RAG chain (retrieval + generation) for query: '{question}'")
+                 if not rag_chain:
+                      return jsonify({"error": "RAG Generation chain not initialized (missing context, LLM, KB, or Vectorstore). Cannot test full RAG."}), 503
+
                  rag_response_obj = rag_chain.invoke({"query": question})
                  generated_answer = rag_response_obj.get('result', "RAG chain could not generate an answer.")
 
-                 # Optionally, get source documents if return_source_documents=True in chain config
+                 # You could add 'source_documents' here if chain was configured with return_source_documents=True
                  # source_docs = rag_response_obj.get('source_documents', [])
                  # source_previews = [{"id": doc.metadata.get("chunk_id"), "text_preview": doc.page_content[:100] + "..."} for doc in source_docs]
 
@@ -1261,6 +1216,7 @@ Answer:"""
                  return jsonify({
                      "query": question,
                      "generated_answer": generated_answer,
+                     "mode": "retrieval_and_generation",
                      # "source_documents": source_previews # Add if return_source_documents is True
                  })
 
@@ -1285,14 +1241,14 @@ def list_knowledge_route():
         docs_info = kb.get_all_documents()
         
         # Get FAISS stats for context
-        faiss_size = kb.vectorstore.index.ntotal if kb.vectorstore and kb.vectorstore.index else 0 # Use index.ntotal for FAISS size
+        faiss_size = kb.vectorstore.index.ntotal if kb.vectorstore and hasattr(kb.vectorstore, 'index') and hasattr(kb.vectorstore.index, 'ntotal') else 0
 
         return jsonify(
             {
                 "total_documents": docs_info["total_documents"],
                 "total_chunks_in_faiss_index": faiss_size,
-                "embedding_model": getattr(embeddings, 'model_name', 'Unknown'), # Get model name from embeddings object
-                "vector_dimension": getattr(embeddings, 'embedding_ctx_length', 'Unknown'), # Get dimension from embeddings object (might be different for different models)
+                "embedding_model": getattr(embeddings, 'model_name', 'Unknown') if embeddings else 'Unknown',
+                "vector_dimension": getattr(embeddings, 'embedding_ctx_length', FAISS_EMBEDDING_DIMENSION) if embeddings else FAISS_EMBEDDING_DIMENSION,
                 "documents": docs_info["documents"] # This already contains id, preview, metadata, chunk_count
             }
         )
@@ -1310,12 +1266,17 @@ def health_check_route():
     
     # Check core component statuses directly
     is_mongodb_connected = kb.mongodb_connected if kb else False
-    is_openai_available = openai_available
+    is_openai_available = openai_available # Based on API key and initialization success
+    is_llm_initialized = llm is not None
+    is_embeddings_initialized = embeddings is not None
+    is_kb_initialized = kb is not None # Checks if KB instance was created
+    is_faiss_initialized = kb and kb.vectorstore is not None
     is_rag_chain_initialized = rag_chain is not None
-    is_search_tool_available = search_tool is not None
+    is_search_tool_available = search_tool is not None # Tool initialized, doesn't mean it's used everywhere
+
 
     db_stats = {}
-    if is_mongodb_connected:
+    if is_kb_initialized and is_mongodb_connected:
         try:
             # Get stats without logging errors unless they are severe
             db_stats_raw = kb.get_database_stats()
@@ -1329,28 +1290,82 @@ def health_check_route():
 
 
     # Overall status: healthy only if critical components are confirmed working
+    # Critical: MongoDB, OpenAI API (for embeddings/LLM), FAISS (if docs exist?), RAG chain
     overall_status = "healthy" 
-    if not is_mongodb_connected or not is_openai_available or not is_rag_chain_initialized:
+    critical_issues = []
+
+    if not is_mongodb_connected:
         overall_status = "unhealthy"
-    # External search and Slack User ID are less critical, might make status 'warning'
-    # if not is_search_tool_available or not SLACK_BOT_USER_ID:
-    #     overall_status = "warning"
+        critical_issues.append("MongoDB Not Connected")
+    if not is_openai_available:
+         overall_status = "unhealthy"
+         critical_issues.append("OpenAI API Not Available (Check Key)")
+    # Check LLM and Embeddings specific initialization
+    if not is_llm_initialized:
+        # This is covered by openai_available check, but good to be specific
+        if overall_status != "unhealthy": # Avoid redundant unhealthy status
+             overall_status = "unhealthy"
+             critical_issues.append("OpenAI Chat Model Not Initialized")
+    if not is_embeddings_initialized:
+         # This is covered by openai_available check, but good to be specific
+        if overall_status != "unhealthy": # Avoid redundant unhealthy status
+             overall_status = "unhealthy"
+             critical_issues.append("OpenAI Embeddings Model Not Initialized")
+
+    # KB needs MongoDB and Embeddings to be useful, check after those
+    if not is_kb_initialized:
+         overall_status = "unhealthy"
+         critical_issues.append("Knowledge Base (KB) Not Initialized")
+    elif not is_faiss_initialized and db_stats.get("total_chunks_in_db", 0) > 0:
+         # FAISS is critical IF there are chunks in the DB to index
+         overall_status = "unhealthy"
+         critical_issues.append("FAISS Index Not Initialized (despite chunks in DB)")
+
+    # RAG chain needs LLM and FAISS retriever
+    if not is_rag_chain_initialized:
+        # Check if it *should* be initialized based on dependencies
+        if is_llm_initialized and is_faiss_initialized:
+             overall_status = "unhealthy"
+             critical_issues.append("RAG Chain Not Initialized (despite LLM & FAISS)")
+        elif overall_status != "unhealthy":
+             overall_status = "warning" # Warning if chain isn't init but dependencies are missing
+             # Specific dependencies listed below
+
+    # Less critical warnings
+    warnings = []
+    if not is_search_tool_available:
+        warnings.append("External Search Tool Unavailable")
+    if not SLACK_BOT_TOKEN:
+        overall_status = "unhealthy" # Slack token is pretty critical for a Slack bot
+        critical_issues.append("Slack Bot Token Not Configured")
+    if not SLACK_BOT_USER_ID:
+        warnings.append("Slack Bot User ID Not Configured (Mentions may fail)")
 
 
-    return jsonify({
+    status_details = {
+        "mongodb": {"status": "ok" if is_mongodb_connected else "error", "details": db_stats},
+        "openai_api": {"status": "ok" if is_openai_available else "error", "details": "API Key validation & basic connection"},
+        "openai_embedding_model": {"status": "ok" if is_embeddings_initialized else "error", "model": getattr(embeddings, 'model_name', 'Unknown') if embeddings else 'Unknown', "dimension": db_stats.get('embedding_dimension', FAISS_EMBEDDING_DIMENSION)},
+        "openai_chat_model": {"status": "ok" if is_llm_initialized else "error", "model": getattr(llm, 'model_name', 'Unknown') if llm else 'Unknown'},
+        "knowledge_base_instance": {"status": "ok" if is_kb_initialized else "error"},
+        "faiss_index": {"status": "ok" if is_faiss_initialized else ("warning" if db_stats.get("total_chunks_in_db", 0) == 0 else "error"), "size": db_stats.get("faiss_index_size", 0), "description": "In-memory vector index"},
+        "rag_chain": {"status": "ok" if is_rag_chain_initialized else "error"},
+        "external_search_tool": {"status": "ok" if is_search_tool_available else "warning"},
+        "slack_token": {"status": "ok" if SLACK_BOT_TOKEN else "error"},
+        "slack_bot_user_id": {"status": "ok" if SLACK_BOT_USER_ID else "warning", "details": "Needed for mentions"}
+    }
+
+    response_data = {
         "status": overall_status,
-        "components": {
-            "mongodb": {"status": "ok" if is_mongodb_connected else "error", "details": db_stats},
-            "openai_api": {"status": "ok" if is_openai_available else "error"},
-            "openai_embedding_model": {"status": "ok" if embeddings else "error", "model": getattr(embeddings, 'model_name', 'Unknown'), "dimension": getattr(embeddings, 'embedding_ctx_length', 'Unknown')},
-            "openai_chat_model": {"status": "ok" if llm else "error", "model": getattr(llm, 'model_name', 'Unknown')},
-            "faiss_index": {"status": "ok" if kb and kb.vectorstore else "error", "size": kb.vectorstore.index.ntotal if kb and kb.vectorstore and kb.vectorstore.index else 0, "description": "In-memory vector index"},
-            "rag_chain": {"status": "ok" if is_rag_chain_initialized else "error"},
-            "external_search_tool": {"status": "ok" if is_search_tool_available else "warning"},
-            "slack_token": {"status": "ok" if SLACK_BOT_TOKEN else "error"},
-            "slack_bot_user_id": {"status": "ok" if SLACK_BOT_USER_ID else "warning", "details": "Needed for mentions"}
-        }
-    })
+        "critical_issues": critical_issues,
+        "warnings": warnings,
+        "components": status_details,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
+
+    status_code = 200 if overall_status == "healthy" else (503 if overall_status == "unhealthy" else 200) # Use 503 for critical failures
+
+    return jsonify(response_data), status_code
 
 
 @app.route("/")
@@ -1358,12 +1373,16 @@ def home_route():
     """Simple homepage route displaying status."""
     # Use status attributes checked in health_check
     is_mongodb_connected = kb.mongodb_connected if kb else False
-    is_openai_available = openai_available
+    is_openai_available = openai_available # Based on API key and initialization success
+    is_llm_initialized = llm is not None
+    is_embeddings_initialized = embeddings is not None
+    is_kb_initialized = kb is not None
+    is_faiss_initialized = kb and kb.vectorstore is not None
     is_rag_chain_initialized = rag_chain is not None
     is_search_tool_available = search_tool is not None
-    
+
     db_stats = {}
-    if is_mongodb_connected and kb:
+    if is_kb_initialized and is_mongodb_connected:
         try:
              db_stats = kb.get_database_stats()
         except Exception as e:
@@ -1373,16 +1392,26 @@ def home_route():
     total_chunks_db = db_stats.get("total_chunks_in_db", "N/A")
     faiss_size = db_stats.get("faiss_index_size", "N/A")
 
-    openai_status = '✅ Configured' if is_openai_available else '❌ NOT CONFIGURED OR UNAVAILABLE!'
+    openai_api_status = '✅ Configured & Available' if is_openai_available else '❌ NOT CONFIGURED OR UNAVAILABLE!'
+    llm_status = '✅ Initialized' if is_llm_initialized else '❌ Not Initialized'
+    embeddings_status = '✅ Initialized' if is_embeddings_initialized else '❌ Not Initialized'
     rag_chain_status = '✅ Initialized' if is_rag_chain_initialized else '❌ Not Initialized (Check dependencies!)'
     mongodb_status = '✅ Connected' if is_mongodb_connected else '❌ NOT CONNECTED!'
-    slack_status = '✅ Configured' if SLACK_BOT_TOKEN else '❌ NOT CONFIGURED!'
+    kb_status = '✅ Initialized' if is_kb_initialized else '❌ Not Initialized'
+    faiss_status = '✅ Initialized' if is_faiss_initialized else ('⚠️ Empty/Not Initialized' if db_stats.get("total_chunks_in_db", 0) == 0 else '❌ Not Initialized (Chunks Exist!)')
+    slack_token_status = '✅ Configured' if SLACK_BOT_TOKEN else '❌ NOT CONFIGURED!'
     slack_user_status = '✅ Configured' if SLACK_BOT_USER_ID else '⚠️ Missing (Mentions might fail)!'
     search_tool_status = '✅ Available' if is_search_tool_available else '⚠️ Unavailable'
 
+
     emb_model_name = getattr(embeddings, 'model_name', 'Unknown') if embeddings else 'Unknown'
-    emb_dim = getattr(embeddings, 'embedding_ctx_length', 'Unknown') if embeddings else 'Unknown' # Or hardcode if specific model
+    emb_dim = getattr(embeddings, 'embedding_ctx_length', FAISS_EMBEDDING_DIMENSION) if embeddings else FAISS_EMBEDDING_DIMENSION
     llm_model_name = getattr(llm, 'model_name', 'Unknown') if llm else 'Unknown'
+    
+    overall_health = "healthy"
+    if not is_mongodb_connected or not is_openai_available or not is_llm_initialized or not is_embeddings_initialized or (db_stats.get("total_chunks_in_db", 0) > 0 and not is_faiss_initialized) or not is_rag_chain_initialized or not SLACK_BOT_TOKEN:
+         overall_health = "unhealthy"
+
 
     return f"""
     <!DOCTYPE html>
@@ -1404,16 +1433,18 @@ def home_route():
     </head>
     <body>
         <h1>🚀 RAG Slack AI Bot Status</h1>
-        <p>Overall Status: <span class="status {'ok' if is_mongodb_connected and is_openai_available and is_rag_chain_initialized else 'error'}">{'✅ Running' if is_mongodb_connected and is_openai_available and is_rag_chain_initialized else '❌ CRITICAL CONFIGURATION ISSUE!'}</span></p>
+        <p>Overall Status: <span class="status {'ok' if overall_health == 'healthy' else 'error'}">{'✅ Running' if overall_health == 'healthy' else '❌ CRITICAL CONFIGURATION ISSUE!'}</span></p>
         
         <h2>🔧 RAG Configuration:</h2>
         <ul>
-            <li><strong>LLM (Generation):</strong> OpenAI (<code id="llm_model">{llm_model_name}</code>) <span class="status {'ok' if llm else 'error'}">{openai_status}</span></li>
-            <li><strong>Embedding Service:</strong> OpenAI (<code id="emb_model">{emb_model_name}</code>, Dim: {emb_dim}) <span class="status {'ok' if embeddings else 'error'}">{openai_status}</span></li>
-            <li><strong>Vector DB:</strong> FAISS (In-memory Index)</li>
+            <li><strong>OpenAI API:</strong> <span class="status {'ok' if is_openai_available else 'error'}">{openai_api_status}</span></li>
+            <li><strong>LLM (Generation):</strong> OpenAI (<code id="llm_model">{llm_model_name}</code>) <span class="status {'ok' if is_llm_initialized else 'error'}">{llm_status}</span></li>
+            <li><strong>Embedding Service:</strong> OpenAI (<code id="emb_model">{emb_model_name}</code>, Dim: {emb_dim}) <span class="status {'ok' if is_embeddings_initialized else 'error'}">{embeddings_status}</span></li>
+            <li><strong>Knowledge Base Instance:</strong> <span class="status {'ok' if is_kb_initialized else 'error'}">{kb_status}</span></li>
+            <li><strong>Vector DB:</strong> FAISS (In-memory Index) <span class="status {'ok' if is_faiss_initialized else ('warning' if db_stats.get('total_chunks_in_db', 0) == 0 else 'error')}">{faiss_status}</span></li>
             <li><strong>Persistence:</strong> MongoDB (<code id="mongo_uri">{MONGODB_URI}</code>, DB: <code id="mongo_db">{MONGODB_DB_NAME}</code>) <span class="status {'ok' if is_mongodb_connected else 'error'}">{mongodb_status}</span></li>
             <li><strong>RAG Chain:</strong> LangChain RetrievalQA <span class="status {'ok' if is_rag_chain_initialized else 'error'}">{rag_chain_status}</span></li>
-             <li><strong>External Search:</strong> DuckDuckGo Tool <span class="status {'ok' if is_search_tool_available else 'warning'}">{search_tool_status}</span></li>
+             <li><strong>External Search Tool:</strong> DuckDuckGo Tool <span class="status {'ok' if is_search_tool_available else 'warning'}">{search_tool_status}</span> (Note: Not used in standard Slack message handler)</li>
         </ul>
 
         <h2>📊 Knowledge Base Stats:</h2>
@@ -1425,7 +1456,7 @@ def home_route():
 
         <h2>💬 Slack Integration:</h2>
         <ul>
-            <li><strong>Slack Bot Token:</strong> <span class="status {'ok' if SLACK_BOT_TOKEN else 'error'}">{slack_status}</span></li>
+            <li><strong>Slack Bot Token:</strong> <span class="status {'ok' if SLACK_BOT_TOKEN else 'error'}">{slack_token_status}</span></li>
             <li><strong>Slack Bot User ID:</strong> <span class="status {'ok' if SLACK_BOT_USER_ID else 'warning'}">{slack_user_status}</span></li>
         </ul>
 
@@ -1450,78 +1481,78 @@ def home_route():
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-    )
+    # Logging is already configured at the top level
     app.logger.info("🚀 Starting RAG-Powered Slack AI Bot with OpenAI + FAISS")
 
-    # Check critical configurations
+    # Check critical configurations for startup
     is_mongodb_connected_startup = kb.mongodb_connected if kb else False
     is_openai_available_startup = openai_available
+    is_llm_initialized_startup = llm is not None
+    is_embeddings_initialized_startup = embeddings is not None
+    is_kb_initialized_startup = kb is not None
+    is_faiss_initialized_startup = kb and kb.vectorstore is not None
     is_rag_chain_initialized_startup = rag_chain is not None
     slack_token_ok_startup = bool(SLACK_BOT_TOKEN)
-    slack_user_id_ok_startup = bool(SLACK_BOT_USER_ID) # Check for user ID too
+    slack_user_id_ok_startup = bool(SLACK_BOT_USER_ID)
 
-
+    startup_issues = []
     if not is_openai_available_startup:
-        app.logger.critical(
-            "FATAL: OpenAI API is not available. Embedding and generation will fail. Please check OPENAI_API_KEY."
-        )
+         startup_issues.append("❌ OpenAI API is not available. Embedding and generation will fail. Check OPENAI_API_KEY.")
+    if not is_llm_initialized_startup:
+         startup_issues.append("❌ OpenAI Chat Model failed to initialize.")
+    if not is_embeddings_initialized_startup:
+         startup_issues.append("❌ OpenAI Embeddings Model failed to initialize.")
     if not slack_token_ok_startup:
-        app.logger.critical(
-            "FATAL: SLACK_BOT_TOKEN is not configured. Bot cannot connect to Slack. Please set SLACK_BOT_TOKEN."
-        )
+        startup_issues.append("❌ SLACK_BOT_TOKEN is not configured. Bot cannot connect to Slack. Please set SLACK_BOT_TOKEN.")
     if not slack_user_id_ok_startup:
-        app.logger.warning(
-             "WARNING: SLACK_BOT_USER_ID is not configured. Bot may not respond correctly to channel mentions. Please set SLACK_BOT_USER_ID."
-        )
+        startup_issues.append("⚠️ SLACK_BOT_USER_ID is not configured. Bot may not respond correctly to channel mentions. Please set SLACK_BOT_USER_ID.")
     if not is_mongodb_connected_startup:
-        app.logger.critical(
-            "FATAL: MongoDB is not connected. Knowledge base persistence will be unavailable. Please check MONGODB_URI."
-        )
-    if not is_rag_chain_initialized_startup and is_mongodb_connected_startup and is_openai_available_startup and kb and kb.vectorstore:
-         # Log warning if rag_chain *should* have initialized but didn't,
-         # assuming dependencies were met
-         app.logger.warning(
-             "WARNING: RAG Chain failed to initialize despite dependencies (MongoDB, OpenAI API, KB, Vectorstore) seeming okay. Check chain creation logic/errors above."
-         )
+        startup_issues.append("❌ MongoDB is not connected. Knowledge base persistence will be unavailable. Please check MONGODB_URI.")
+    # Check FAISS status relative to DB content at startup
+    if is_kb_initialized_startup and is_mongodb_connected_startup:
+         try:
+             db_stats_startup = kb.get_database_stats()
+             if db_stats_startup.get("total_chunks_in_db", 0) > 0 and not is_faiss_initialized_startup:
+                  startup_issues.append("❌ FAISS Index failed to initialize/load despite having chunks in MongoDB.")
+             elif db_stats_startup.get("error"):
+                 startup_issues.append(f"⚠️ Could not fetch MongoDB stats at startup: {db_stats_startup['error']}")
+         except Exception as e:
+             startup_issues.append(f"⚠️ Error checking MongoDB stats at startup: {e}")
+             
+    if not is_rag_chain_initialized_startup and is_llm_initialized_startup and (is_faiss_initialized_startup or (is_kb_initialized_startup and is_mongodb_connected_startup and kb.get_database_stats().get("total_chunks_in_db", 0) == 0)):
+         # Only report as error if chain *should* have initialized based on core dependencies
+         # (LLM + (initialized FAISS OR empty KB))
+         startup_issues.append("❌ RAG Chain failed to initialize.")
 
 
     app.logger.info("\n" + "=" * 80)
     app.logger.info("🎯 OpenAI + FAISS RAG Bot Startup Summary:")
 
-    # Access status flags and model names safely
+    for msg in startup_issues:
+        app.logger.info(f"   {msg}")
+
+    if not startup_issues:
+         app.logger.info("   ✅ All critical components initialized successfully.")
+
     app.logger.info(
-        f"   • OpenAI API: {'✅' if is_openai_available_startup else '❌ (KEY/CONNECT ISSUE!)'}"
+        f"   • LLM Model: {getattr(llm, 'model_name', 'Unknown') if llm else 'N/A'}"
     )
     app.logger.info(
-        f"   • LLM (Generation): {'OpenAI (' + getattr(llm, 'model_name', 'Unknown') + ')' if llm else 'Unavailable'} {'✅' if llm else '❌'}"
+        f"   • Embeddings Model: {getattr(embeddings, 'model_name', 'Unknown') if embeddings else 'N/A'} (Dim: {getattr(embeddings, 'embedding_ctx_length', FAISS_EMBEDDING_DIMENSION) if embeddings else FAISS_EMBEDDING_DIMENSION})"
     )
     app.logger.info(
-        f"   • Embeddings: {'OpenAI (' + getattr(embeddings, 'model_name', 'Unknown') + ', Dim: ' + str(getattr(embeddings, 'embedding_ctx_length', 'Unknown')) + ')' if embeddings else 'Unavailable'} {'✅' if embeddings else '❌'}"
-    )
-    app.logger.info(
-        f"   • RAG Chain (RetrievalQA): {'✅ Initialized' if is_rag_chain_initialized_startup else '❌ Not Initialized'}"
-    )
-    app.logger.info(
-        f"   • External Search Tool: {'✅ Available' if search_tool else '⚠️ Unavailable'}"
-    )
-    app.logger.info(
-        f"   • Slack Integration: {'✅ Configured' if slack_token_ok_startup else '❌ (TOKEN ISSUE!)'} (User ID {'✅' if slack_user_id_ok_startup else '⚠️ MISSING!'})"
-    )
-    app.logger.info(
-        f"   • MongoDB Connection: {'✅ Connected' if is_mongodb_connected_startup else '❌ (CONNECTION ISSUE!)'}"
-    )
-    app.logger.info(
-        f"   • FAISS Index Size: {kb.vectorstore.index.ntotal if kb and kb.vectorstore and kb.vectorstore.index else 0} chunks"
+        f"   • FAISS Index Size (approx): {kb.vectorstore.index.ntotal if kb and kb.vectorstore and hasattr(kb.vectorstore, 'index') and hasattr(kb.vectorstore.index, 'ntotal') else 0} chunks"
     )
     
     port = int(os.environ.get("PORT", 3000))
     app.logger.info(f"🌐 Web interface: http://localhost:{port}")
     app.logger.info("=" * 80 + "\n")
 
-    if not is_mongodb_connected_startup or not is_openai_available_startup or not slack_token_ok_startup or not is_rag_chain_initialized_startup:
-         app.logger.warning("CRITICAL CONFIGURATION ISSUES DETECTED. BOT MAY NOT FUNCTION CORRECTLY.")
+    if any("❌" in msg for msg in startup_issues):
+         app.logger.critical("CRITICAL CONFIGURATION ISSUES DETECTED. BOT MAY NOT FUNCTION CORRECTLY.")
+    elif any("⚠️" in msg for msg in startup_issues):
+         app.logger.warning("WARNING: Non-critical configuration issues detected.")
+
 
     # Running with debug=True and use_reloader=False is good for development
     # In production, disable debug and use a production-ready WSGI server (like Gunicorn)

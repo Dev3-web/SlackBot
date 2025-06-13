@@ -18,3 +18,5 @@ langchain>=0.2.0
 langchain-openai>=0.1.8
 langchain-community>=0.2.0
 duckduckgo-search>=3.9
+langchain-chroma
+PyPDF2

@@ -1480,81 +1480,81 @@ def home_route():
 
 
 # --- Main Execution Block ---
-if __name__ == "__main__":
-    # Logging is already configured at the top level
-    app.logger.info("🚀 Starting RAG-Powered Slack AI Bot with OpenAI + FAISS")
+# if __name__ == "__main__":
+#     # Logging is already configured at the top level
+#     app.logger.info("🚀 Starting RAG-Powered Slack AI Bot with OpenAI + FAISS")
 
-    # Check critical configurations for startup
-    is_mongodb_connected_startup = kb.mongodb_connected if kb else False
-    is_openai_available_startup = openai_available
-    is_llm_initialized_startup = llm is not None
-    is_embeddings_initialized_startup = embeddings is not None
-    is_kb_initialized_startup = kb is not None
-    is_faiss_initialized_startup = kb and kb.vectorstore is not None
-    is_rag_chain_initialized_startup = rag_chain is not None
-    slack_token_ok_startup = bool(SLACK_BOT_TOKEN)
-    slack_user_id_ok_startup = bool(SLACK_BOT_USER_ID)
+#     # Check critical configurations for startup
+#     is_mongodb_connected_startup = kb.mongodb_connected if kb else False
+#     is_openai_available_startup = openai_available
+#     is_llm_initialized_startup = llm is not None
+#     is_embeddings_initialized_startup = embeddings is not None
+#     is_kb_initialized_startup = kb is not None
+#     is_faiss_initialized_startup = kb and kb.vectorstore is not None
+#     is_rag_chain_initialized_startup = rag_chain is not None
+#     slack_token_ok_startup = bool(SLACK_BOT_TOKEN)
+#     slack_user_id_ok_startup = bool(SLACK_BOT_USER_ID)
 
-    startup_issues = []
-    if not is_openai_available_startup:
-         startup_issues.append("❌ OpenAI API is not available. Embedding and generation will fail. Check OPENAI_API_KEY.")
-    if not is_llm_initialized_startup:
-         startup_issues.append("❌ OpenAI Chat Model failed to initialize.")
-    if not is_embeddings_initialized_startup:
-         startup_issues.append("❌ OpenAI Embeddings Model failed to initialize.")
-    if not slack_token_ok_startup:
-        startup_issues.append("❌ SLACK_BOT_TOKEN is not configured. Bot cannot connect to Slack. Please set SLACK_BOT_TOKEN.")
-    if not slack_user_id_ok_startup:
-        startup_issues.append("⚠️ SLACK_BOT_USER_ID is not configured. Bot may not respond correctly to channel mentions. Please set SLACK_BOT_USER_ID.")
-    if not is_mongodb_connected_startup:
-        startup_issues.append("❌ MongoDB is not connected. Knowledge base persistence will be unavailable. Please check MONGODB_URI.")
-    # Check FAISS status relative to DB content at startup
-    if is_kb_initialized_startup and is_mongodb_connected_startup:
-         try:
-             db_stats_startup = kb.get_database_stats()
-             if db_stats_startup.get("total_chunks_in_db", 0) > 0 and not is_faiss_initialized_startup:
-                  startup_issues.append("❌ FAISS Index failed to initialize/load despite having chunks in MongoDB.")
-             elif db_stats_startup.get("error"):
-                 startup_issues.append(f"⚠️ Could not fetch MongoDB stats at startup: {db_stats_startup['error']}")
-         except Exception as e:
-             startup_issues.append(f"⚠️ Error checking MongoDB stats at startup: {e}")
+#     startup_issues = []
+#     if not is_openai_available_startup:
+#          startup_issues.append("❌ OpenAI API is not available. Embedding and generation will fail. Check OPENAI_API_KEY.")
+#     if not is_llm_initialized_startup:
+#          startup_issues.append("❌ OpenAI Chat Model failed to initialize.")
+#     if not is_embeddings_initialized_startup:
+#          startup_issues.append("❌ OpenAI Embeddings Model failed to initialize.")
+#     if not slack_token_ok_startup:
+#         startup_issues.append("❌ SLACK_BOT_TOKEN is not configured. Bot cannot connect to Slack. Please set SLACK_BOT_TOKEN.")
+#     if not slack_user_id_ok_startup:
+#         startup_issues.append("⚠️ SLACK_BOT_USER_ID is not configured. Bot may not respond correctly to channel mentions. Please set SLACK_BOT_USER_ID.")
+#     if not is_mongodb_connected_startup:
+#         startup_issues.append("❌ MongoDB is not connected. Knowledge base persistence will be unavailable. Please check MONGODB_URI.")
+#     # Check FAISS status relative to DB content at startup
+#     if is_kb_initialized_startup and is_mongodb_connected_startup:
+#          try:
+#              db_stats_startup = kb.get_database_stats()
+#              if db_stats_startup.get("total_chunks_in_db", 0) > 0 and not is_faiss_initialized_startup:
+#                   startup_issues.append("❌ FAISS Index failed to initialize/load despite having chunks in MongoDB.")
+#              elif db_stats_startup.get("error"):
+#                  startup_issues.append(f"⚠️ Could not fetch MongoDB stats at startup: {db_stats_startup['error']}")
+#          except Exception as e:
+#              startup_issues.append(f"⚠️ Error checking MongoDB stats at startup: {e}")
              
-    if not is_rag_chain_initialized_startup and is_llm_initialized_startup and (is_faiss_initialized_startup or (is_kb_initialized_startup and is_mongodb_connected_startup and kb.get_database_stats().get("total_chunks_in_db", 0) == 0)):
-         # Only report as error if chain *should* have initialized based on core dependencies
-         # (LLM + (initialized FAISS OR empty KB))
-         startup_issues.append("❌ RAG Chain failed to initialize.")
+#     if not is_rag_chain_initialized_startup and is_llm_initialized_startup and (is_faiss_initialized_startup or (is_kb_initialized_startup and is_mongodb_connected_startup and kb.get_database_stats().get("total_chunks_in_db", 0) == 0)):
+#          # Only report as error if chain *should* have initialized based on core dependencies
+#          # (LLM + (initialized FAISS OR empty KB))
+#          startup_issues.append("❌ RAG Chain failed to initialize.")
 
 
-    app.logger.info("\n" + "=" * 80)
-    app.logger.info("🎯 OpenAI + FAISS RAG Bot Startup Summary:")
+#     app.logger.info("\n" + "=" * 80)
+#     app.logger.info("🎯 OpenAI + FAISS RAG Bot Startup Summary:")
 
-    for msg in startup_issues:
-        app.logger.info(f"   {msg}")
+#     for msg in startup_issues:
+#         app.logger.info(f"   {msg}")
 
-    if not startup_issues:
-         app.logger.info("   ✅ All critical components initialized successfully.")
+#     if not startup_issues:
+#          app.logger.info("   ✅ All critical components initialized successfully.")
 
-    app.logger.info(
-        f"   • LLM Model: {getattr(llm, 'model_name', 'Unknown') if llm else 'N/A'}"
-    )
-    app.logger.info(
-        f"   • Embeddings Model: {getattr(embeddings, 'model_name', 'Unknown') if embeddings else 'N/A'} (Dim: {getattr(embeddings, 'embedding_ctx_length', FAISS_EMBEDDING_DIMENSION) if embeddings else FAISS_EMBEDDING_DIMENSION})"
-    )
-    app.logger.info(
-        f"   • FAISS Index Size (approx): {kb.vectorstore.index.ntotal if kb and kb.vectorstore and hasattr(kb.vectorstore, 'index') and hasattr(kb.vectorstore.index, 'ntotal') else 0} chunks"
-    )
+#     app.logger.info(
+#         f"   • LLM Model: {getattr(llm, 'model_name', 'Unknown') if llm else 'N/A'}"
+#     )
+#     app.logger.info(
+#         f"   • Embeddings Model: {getattr(embeddings, 'model_name', 'Unknown') if embeddings else 'N/A'} (Dim: {getattr(embeddings, 'embedding_ctx_length', FAISS_EMBEDDING_DIMENSION) if embeddings else FAISS_EMBEDDING_DIMENSION})"
+#     )
+#     app.logger.info(
+#         f"   • FAISS Index Size (approx): {kb.vectorstore.index.ntotal if kb and kb.vectorstore and hasattr(kb.vectorstore, 'index') and hasattr(kb.vectorstore.index, 'ntotal') else 0} chunks"
+#     )
     
-    port = int(os.environ.get("PORT", 3000))
-    app.logger.info(f"🌐 Web interface: http://localhost:{port}")
-    app.logger.info("=" * 80 + "\n")
+#     port = int(os.environ.get("PORT", 3000))
+#     app.logger.info(f"🌐 Web interface: http://localhost:{port}")
+#     app.logger.info("=" * 80 + "\n")
 
-    if any("❌" in msg for msg in startup_issues):
-         app.logger.critical("CRITICAL CONFIGURATION ISSUES DETECTED. BOT MAY NOT FUNCTION CORRECTLY.")
-    elif any("⚠️" in msg for msg in startup_issues):
-         app.logger.warning("WARNING: Non-critical configuration issues detected.")
+#     if any("❌" in msg for msg in startup_issues):
+#          app.logger.critical("CRITICAL CONFIGURATION ISSUES DETECTED. BOT MAY NOT FUNCTION CORRECTLY.")
+#     elif any("⚠️" in msg for msg in startup_issues):
+#          app.logger.warning("WARNING: Non-critical configuration issues detected.")
 
 
-    # Running with debug=True and use_reloader=False is good for development
-    # In production, disable debug and use a production-ready WSGI server (like Gunicorn)
-    # and consider running handle_message asynchronously.
-    app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)
+#     # Running with debug=True and use_reloader=False is good for development
+#     # In production, disable debug and use a production-ready WSGI server (like Gunicorn)
+#     # and consider running handle_message asynchronously.
+#     app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)

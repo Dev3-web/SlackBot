@@ -37,7 +37,7 @@ st.markdown("""
 
 # --- API Configuration & State Management ---
 if 'api_url' not in st.session_state:
-    st.session_state.api_url = "http://localhost:3000"
+    st.session_state.api_url = "https://slackbot-4.onrender.com"
 
 # --- API Helper Function ---
 def api_request(endpoint: str, method: str = "GET", data: dict = None, files: dict = None):
@@ -48,14 +48,14 @@ def api_request(endpoint: str, method: str = "GET", data: dict = None, files: di
         headers = {'Content-Type': 'application/json'}
         
         if method == "GET":
-            response = requests.get(url, timeout=15)
+            response = requests.get(url, timeout=100)
         elif method == "POST":
             # For file uploads, requests handles headers automatically.
             # For JSON, we set it explicitly.
             if files:
                 response = requests.post(url, data=data, files=files, timeout=90)
             else:
-                response = requests.post(url, json=data, headers=headers, timeout=60)
+                response = requests.post(url, json=data, headers=headers, timeout=90)
         elif method == "DELETE":
             response = requests.delete(url, timeout=15)
         else:
@@ -120,7 +120,7 @@ with st.sidebar:
 # --- Main Page Layout ---
 st.markdown('<h1 class="main-header">RAG Slack Bot Manager</h1>', unsafe_allow_html=True)
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "📚 Knowledge Base", "🔍 Search & Debug", "💬 Slack Setup"])
+tab1, tab2, tab3= st.tabs(["📊 Dashboard", "📚 Knowledge Base", "🔍 Search"])
 
 # --- Dashboard Tab ---
 with tab1:
@@ -286,47 +286,3 @@ with tab3:
             with st.expander("View Source Documents Used for this Answer"):
                 st.json(rag_data.get("source_documents", []))
 
-# --- Slack Setup Guide Tab ---
-with tab4:
-    st.header("Slack Integration Setup")
-    st.markdown("""
-    To connect your RAG bot to a Slack workspace, you need to create a Slack App and configure it correctly.
-
-    ### 1. Create a Slack App
-    - Go to [api.slack.com/apps](https://api.slack.com/apps) and click **"Create New App"**.
-    - Choose **"From scratch"**, name your app, and select your workspace.
-
-    ### 2. Add Scopes (Bot Permissions)
-    - In the app's settings, go to the **"OAuth & Permissions"** page.
-    - In the "Scopes" section, under "Bot Token Scopes", add the following:
-        - `app_mentions:read` (to see when your bot is @mentioned)
-        - `chat:write` (to send messages)
-        - `im:history` (to read direct messages)
-
-    ### 3. Install the App to Your Workspace
-    - At the top of the **"OAuth & Permissions"** page, click **"Install to Workspace"**.
-    - Follow the prompts. After installation, you will see a **"Bot User OAuth Token"**.
-    - **Copy this token.** It starts with `xoxb-`.
-
-    ### 4. Set Environment Variables
-    - Create a `.env` file in your project directory (if you haven't already).
-    - Add the Bot Token to your `.env` file:
-      ```
-      SLACK_BOT_TOKEN="xoxb-YOUR-COPIED-TOKEN-HERE"
-      ```
-    - You also need the **Bot User ID**. Find this on the **"Basic Information"** page of your Slack app settings, under "App Credentials". It starts with a `U`.
-      ```
-      SLACK_BOT_USER_ID="U0..."
-      ```
-    - **Restart your Flask `app.py` server** for it to load these new variables.
-
-    ### 5. Configure Event Subscriptions (for a public server)
-    - If your bot is running on a public URL (e.g., on a cloud server), go to **"Event Subscriptions"**.
-    - Enable events and enter your public Request URL: `https://your-public-url.com/slack/events`.
-    - Under "Subscribe to bot events", add `app_mention` and `message.im`.
-
-    ### 6. Using `ngrok` for Local Development
-    - If you are running the bot locally, Slack can't reach it. Use `ngrok` to create a public URL for your local server.
-    - Install ngrok, then run: `ngrok http 3000` (if your Flask app is on port 3000).
-    - Use the `https` URL provided by ngrok as your Request URL in the "Event Subscriptions" step above.
-    """)

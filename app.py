@@ -71,7 +71,7 @@ class RAGKnowledgeBase:
 
     def _init_vectorstore(self):
         if not self.embeddings:
-            app.logger.error("❌ Cannot initialize ChromaDB: Embeddings model is not available.")
+            app.logger.error("Cannot initialize ChromaDB: Embeddings model is not available.")
             return
         
         try:
@@ -80,9 +80,9 @@ class RAGKnowledgeBase:
                 persist_directory=self.persist_directory,
                 embedding_function=self.embeddings
             )
-            app.logger.info(f"✅ ChromaDB vector store initialized from/to: {self.persist_directory}")
+            app.logger.info(f"ChromaDB vector store initialized from/to: {self.persist_directory}")
         except Exception as e:
-            app.logger.critical(f"❌ CRITICAL: Failed to initialize ChromaDB vector store: {e}")
+            app.logger.critical(f"CRITICAL: Failed to initialize ChromaDB vector store: {e}")
 
     def add_document(self, doc_id: str, text: str, metadata: dict = None):
         if not self.vectorstore:
@@ -221,13 +221,13 @@ Answer:"""
                 chain_type_kwargs={"prompt": RAG_PROMPT},
                 return_source_documents=True
             )
-            app.logger.info("✅ LangChain RAG chain initialized.")
+            app.logger.info("LangChain RAG chain initialized.")
         else:
-            app.logger.error("❌ Failed to get retriever from ChromaDB. RAG chain not initialized.")
+            app.logger.error("Failed to get retriever from ChromaDB. RAG chain not initialized.")
     else:
-        app.logger.error("❌ RAG chain not initialized due to missing LLM or Vector Store.")
+        app.logger.error("RAG chain not initialized due to missing LLM or Vector Store.")
 else:
-    app.logger.critical("❌ Knowledge Base and RAG chain skipped due to OpenAI unavailability.")
+    app.logger.critical("Knowledge Base and RAG chain skipped due to OpenAI unavailability.")
 
 
 # --- PDF Processing Utility ---
@@ -248,36 +248,36 @@ def extract_text_from_pdf(pdf_file) -> str:
 # --- Enhanced Conversational Helpers ---
 
 GREETINGS = [
-    "Hello there! 👋 I'm your friendly knowledge assistant. How can I help you ?",
-    "Hi! 🌟 Great to see you! What would you like to discover?",
-    "Hey there! 😊 I'm here and ready to help you find answers. What's on your mind?",
-    "Greetings! 🚀 I'm your AI knowledge companion. Ask me anything about our documents and data!",
-    "Hello! ✨ Welcome! I'm excited to helping you . What can I find for you?",
-    "Hi there! 🎯 I'm your personal knowledge assistant. Ready to dive into some questions?",
-    "Hey! 💡 Good to see you! I'm here to help you.",
-    "Hello and welcome! 🔍 I'm your dedicated search assistant. What information are you looking for today?"
+    "Hello there! I'm your friendly knowledge assistant. How can I help you explore our knowledge base today?",
+    "Hi! Great to see you! What would you like to discover in our knowledge base?",
+    "Hey there! I'm here and ready to help you find answers. What's on your mind?",
+    "Greetings! I'm your AI knowledge companion. Ask me anything about our documents and data!",
+    "Hello! Welcome! I'm excited to help you search through our knowledge base. What can I find for you?",
+    "Hi there! I'm your personal knowledge assistant. Ready to dive into some questions?",
+    "Hey! Good to see you! I'm here to help you unlock insights from our knowledge base.",
+    "Hello and welcome! I'm your dedicated search assistant. What information are you looking for today?"
 ]
 
 FAREWELLS = [
-    "Goodbye! 👋 It was wonderful helping you today. Feel free to come back anytime with more questions!",
-    "Farewell! 🌟 Hope I was able to help. Don't hesitate to reach out whenever you need assistance!",
-    "See you later! 😊 Thanks for the great conversation. I'll be here whenever you need me!",
-    "Bye for now! 🚀 Keep exploring and learning. I'm always here when you need answers!",
-    "Take care! ✨ It's been a pleasure assisting you. Come back anytime with new questions!",
-    "Goodbye and have a fantastic day! 🎯 Remember, I'm just a message away when you need help!",
-    "Until next time! 💡 Hope you found what you were looking for. Stay curious!",
-    "Farewell! 🔍 Thanks for letting me help. I'm always ready for your next knowledge quest!"
+    "Goodbye! It was wonderful helping you today. Feel free to come back anytime with more questions!",
+    "Farewell! Hope I was able to help. Don't hesitate to reach out whenever you need assistance!",
+    "See you later! Thanks for the great conversation. I'll be here whenever you need me!",
+    "Bye for now! Keep exploring and learning. I'm always here when you need answers!",
+    "Take care! It's been a pleasure assisting you. Come back anytime with new questions!",
+    "Goodbye and have a fantastic day! Remember, I'm just a message away when you need help!",
+    "Until next time! Hope you found what you were looking for. Stay curious!",
+    "Farewell! Thanks for letting me help. I'm always ready for your next knowledge quest!"
 ]
 
 THANKS_RESPONSES = [
-    "You're absolutely welcome! 😊 Happy to help anytime!",
-    "My pleasure! 🌟 That's what I'm here for!",
-    "No problem at all! 🚀 Glad I could assist you!",
-    "Anytime! 💡 I love helping people find answers!",
-    "You're so welcome! ✨ It makes me happy to be helpful!",
-    "Happy to help! 🎯 Feel free to ask more questions anytime!",
-    "Of course! 👋 Helping you succeed is my favorite thing!",
-    "Always a pleasure! 🔍 I'm here whenever you need assistance!"
+    "You're absolutely welcome! Happy to help anytime!",
+    "My pleasure! That's what I'm here for!",
+    "No problem at all! Glad I could assist you!",
+    "Anytime! I love helping people find answers!",
+    "You're so welcome! It makes me happy to be helpful!",
+    "Happy to help! Feel free to ask more questions anytime!",
+    "Of course! Helping you succeed is my favorite thing!",
+    "Always a pleasure! I'm here whenever you need assistance!"
 ]
 
 def get_random_response(response_list):
@@ -342,7 +342,7 @@ def handle_message(event):
     else:
         # --- RAG Logic ---
         if not rag_chain:
-            response_text = "I'm sorry, but my knowledge system is currently unavailable. Please check with the administrator or try again later. 🔧"
+            response_text = "I'm sorry, but my knowledge system is currently unavailable. Please check with the administrator or try again later."
             app.logger.error("RAG chain not available for Slack request.")
         else:
             try:
@@ -356,11 +356,11 @@ def handle_message(event):
                     #     sources = [doc.metadata.get('doc_id', 'Unknown') for doc in result['source_documents']]
                     #     response_text += f"\n\n_Source(s): {', '.join(sorted(list(set(sources))))}_"
                 else:
-                    response_text = "I couldn't find any relevant information in the knowledge base to answer your question. Try rephrasing or asking about something else! 🔍"
+                    response_text = "I couldn't find any relevant information in the knowledge base to answer your question. Try rephrasing or asking about something else!"
 
             except Exception as e:
                 app.logger.error(f"Error during RAG chain invocation: {e}", exc_info=True)
-                response_text = "Sorry, I encountered an error while searching my knowledge base. Please try again! ⚠️"
+                response_text = "Sorry, I encountered an error while searching my knowledge base. Please try again!"
 
     # --- Send Response to Slack ---
     try:
@@ -524,5 +524,5 @@ def home_route():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
-    app.logger.info(f"🚀 Starting RAG Bot on http://localhost:{port}")
+    app.logger.info(f"Starting RAG Bot on http://localhost:{port}")
     app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)

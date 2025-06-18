@@ -3,27 +3,22 @@ import json
 import random
 from datetime import datetime
 import io
-import threading # Used for optional background processing to ensure quick Slack response
-
-# --- Core Imports ---
+import threading 
 from flask import Flask, request, jsonify
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import logging
 from dotenv import load_dotenv
-
-# --- Vector Store Imports (ChromaDB is now the sole DB) ---
 from langchain_chroma import Chroma
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain_core.documents import Document
+import PyPDF2
 
-# --- Utility Imports ---
-import PyPDF2 # Corrected import casing
 
-# Load environment variables from .env file
+
 load_dotenv()
 
 # --- Logging Configuration ---
@@ -200,7 +195,24 @@ rag_chain = None
 
 if openai_available:
     kb = RAGKnowledgeBase(embeddings, CHROMA_PERSIST_DIR)
+
+    ### MODIFICATION START: Define the intent classification chain ###
+    intent_prompt_template = """You are an expert at classifying user intent. Analyze the user's message and classify it into one of the following categories:
+- GREETING: For hellos, good mornings, or general greetings.
+- FAREWELL: For goodbyes, see you later, etc.
+- THANKS: For expressions of gratitude.
+- KNOWLEDGE_BASE_QUERY: For any question that seeks specific information, asks for an explanation, or requests data that would likely be found in documents. This is the default for any real question.
+
+User message: "{user_input}"
+
+You must respond with ONLY the category name and nothing else.
+Category:"""
+    INTENT_PROMPT = PromptTemplate(template=intent_prompt_template, input_variables=["user_input"])
     
+    intent_classifier_chain = INTENT_PROMPT | llm 
+    app.logger.info("Intent Classification chain initialized.")
+    ### MODIFICATION END ###
+
     if kb.vectorstore and llm:
         retriever = kb.get_retriever()
         if retriever:
@@ -227,14 +239,14 @@ Answer:"""
     else:
         app.logger.error("RAG chain not initialized due to missing LLM or Vector Store.")
 else:
-    app.logger.critical("Knowledge Base and RAG chain skipped due to OpenAI unavailability.")
+    app.logger.critical("Knowledge Base, RAG chain, and Intent Classifier skipped due to OpenAI unavailability.")
 
 
 # --- PDF Processing Utility ---
 def extract_text_from_pdf(pdf_file) -> str:
     text = ""
     try:
-        reader = PyPDF2.PdfReader(pdf_file) # Corrected usage
+        reader = PyPDF2.PdfReader(pdf_file)
         for page in reader.pages:
             page_text = page.extract_text()
             if page_text:
@@ -245,73 +257,28 @@ def extract_text_from_pdf(pdf_file) -> str:
     return text.strip()
 
 
+
 # --- Enhanced Conversational Helpers ---
 
 GREETINGS = [
     "Hello there! I'm your friendly knowledge assistant. How can I help you explore our knowledge base today?",
     "Hi! Great to see you! What would you like to discover in our knowledge base?",
     "Hey there! I'm here and ready to help you find answers. What's on your mind?",
-    "Greetings! I'm your AI knowledge companion. Ask me anything about our documents and data!",
-    "Hello! Welcome! I'm excited to help you search through our knowledge base. What can I find for you?",
-    "Hi there! I'm your personal knowledge assistant. Ready to dive into some questions?",
-    "Hey! Good to see you! I'm here to help you unlock insights from our knowledge base.",
-    "Hello and welcome! I'm your dedicated search assistant. What information are you looking for today?"
 ]
-
 FAREWELLS = [
-    "Goodbye! It was wonderful helping you today. Feel free to come back anytime with more questions!",
-    "Farewell! Hope I was able to help. Don't hesitate to reach out whenever you need assistance!",
-    "See you later! Thanks for the great conversation. I'll be here whenever you need me!",
-    "Bye for now! Keep exploring and learning. I'm always here when you need answers!",
-    "Take care! It's been a pleasure assisting you. Come back anytime with new questions!",
-    "Goodbye and have a fantastic day! Remember, I'm just a message away when you need help!",
-    "Until next time! Hope you found what you were looking for. Stay curious!",
-    "Farewell! Thanks for letting me help. I'm always ready for your next knowledge quest!"
+    "Goodbye! It was wonderful helping you today. Feel free to come back anytime!",
+    "Farewell! Hope I was able to help. Don't hesitate to reach out again!",
+    "See you later! Thanks for the great conversation. I'll be here if you need me!",
 ]
-
 THANKS_RESPONSES = [
     "You're absolutely welcome! Happy to help anytime!",
     "My pleasure! That's what I'm here for!",
     "No problem at all! Glad I could assist you!",
-    "Anytime! I love helping people find answers!",
-    "You're so welcome! It makes me happy to be helpful!",
-    "Happy to help! Feel free to ask more questions anytime!",
-    "Of course! Helping you succeed is my favorite thing!",
-    "Always a pleasure! I'm here whenever you need assistance!"
 ]
+
 
 def get_random_response(response_list):
     return random.choice(response_list)
-
-def detect_greeting(text):
-    text = text.lower().strip()
-    greeting_patterns = [
-        "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
-        "greetings", "hiya", "howdy", "what's up", "whats up", "sup",
-        "good day", "hei", "hola", "bonjour", "namaste"
-    ]
-    # Check if text starts with greeting or is just a greeting
-    return any(text.startswith(pattern) or text == pattern for pattern in greeting_patterns)
-
-def detect_farewell(text):
-    text = text.lower().strip()
-    farewell_patterns = [
-        "bye", "goodbye", "farewell", "see ya", "see you", "cya", "talk later",
-        "catch you later", "until next time", "take care", "so long",
-        "have a good day", "have a great day", "good night", "goodnight",
-        "peace", "later", "bye bye", "see you later", "ttyl", "gotta go"
-    ]
-    return any(pattern in text for pattern in farewell_patterns)
-
-def detect_thanks(text):
-    text = text.lower().strip()
-    thanks_patterns = [
-        "thanks", "thank you", "thx", "appreciate it", "appreciate",
-        "grateful", "cheers", "much appreciated", "thanks a lot",
-        "thank you so much", "ty", "tysm", "appreciated"
-    ]
-    return any(pattern in text for pattern in thanks_patterns)
-
 
 # --- Slack Event Handler ---
 def handle_message(event):
@@ -322,8 +289,9 @@ def handle_message(event):
     if user_id == SLACK_BOT_USER_ID:
         return
     
-    # Remove bot mention from text, if present, and strip whitespace
-    text = event.get("text", "").replace(f"<@{SLACK_BOT_USER_ID}>", "").strip()
+    # Get original text and remove bot mention
+    original_text = event.get("text", "")
+    text = original_text.replace(f"<@{SLACK_BOT_USER_ID}>", "").strip()
     thread_ts = event.get("ts") # Get thread_ts to reply in thread if it's a threaded message
 
     # Ignore empty messages
@@ -333,34 +301,74 @@ def handle_message(event):
     response_text = ""
 
     # --- Enhanced Conversational Logic ---
-    if detect_greeting(text):
-        response_text = get_random_response(GREETINGS)
-    elif detect_thanks(text):
-        response_text = get_random_response(THANKS_RESPONSES)
-    elif detect_farewell(text):
-        response_text = get_random_response(FAREWELLS)
+    if not intent_classifier_chain:
+        response_text = "I'm sorry, but my core intelligence system is currently offline. Please notify an administrator."
+        app.logger.error("Intent classifier chain is not available for Slack request.")
     else:
-        # --- RAG Logic ---
-        if not rag_chain:
-            response_text = "I'm sorry, but my knowledge system is currently unavailable. Please check with the administrator or try again later."
-            app.logger.error("RAG chain not available for Slack request.")
-        else:
-            try:
-                app.logger.info(f"Invoking RAG chain for query: '{text}'")
-                result = rag_chain.invoke({"query": text})
-                
-                if result.get("result"): # Ensure there's a result from the LLM
-                    response_text = result["result"]
-                    # Optional: Add source document info for transparency
-                    # if result.get("source_documents"):
-                    #     sources = [doc.metadata.get('doc_id', 'Unknown') for doc in result['source_documents']]
-                    #     response_text += f"\n\n_Source(s): {', '.join(sorted(list(set(sources))))}_"
-                else:
-                    response_text = "I couldn't find any relevant information in the knowledge base to answer your question. Try rephrasing or asking about something else!"
+        try:
+            # Step 1: Classify the user's intent using cleaned text
+            intent_result = intent_classifier_chain.invoke({"user_input": text})
+            
+            # Extract intent from result (handle both string and dict responses)
+            if isinstance(intent_result, dict):
+                intent = intent_result.get("intent", intent_result.get("output", ""))
+            else:
+                intent = str(intent_result)
+            
+            app.logger.info(f"Classified intent as '{intent}' for query: '{text}'")
 
-            except Exception as e:
-                app.logger.error(f"Error during RAG chain invocation: {e}", exc_info=True)
-                response_text = "Sorry, I encountered an error while searching my knowledge base. Please try again!"
+            # Step 2: Route based on intent (case-insensitive matching)
+            intent_upper = intent.upper()
+            
+            if "GREETING" in intent_upper:
+                response_text = get_random_response(GREETINGS)
+            elif "THANKS" in intent_upper or "THANK" in intent_upper:
+                response_text = get_random_response(THANKS_RESPONSES)
+            elif "FAREWELL" in intent_upper or "GOODBYE" in intent_upper or "BYE" in intent_upper:
+                response_text = get_random_response(FAREWELLS)
+            elif "KNOWLEDGE_BASE_QUERY" in intent_upper or "QUESTION" in intent_upper:
+                # This is a real question, so we use the RAG chain
+                if not rag_chain:
+                    response_text = "I'm sorry, but my knowledge base is currently unavailable. Please try again later."
+                    app.logger.error("RAG chain not available for a knowledge base query.")
+                else:
+                    app.logger.info(f"Invoking RAG chain for query: '{text}'")
+                    result = rag_chain.invoke({"query": text})
+                    
+                    if result.get("result"):
+                        response_text = result["result"]
+                    else:
+                        response_text = "I couldn't find any relevant information in the knowledge base to answer that. Could you try rephrasing your question?"
+            else:
+                # Fallback - try to detect common greeting patterns manually
+                text_lower = text.lower()
+                greeting_words = ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening']
+                farewell_words = ['bye', 'goodbye', 'see you', 'farewell', 'take care']
+                thanks_words = ['thanks', 'thank you', 'thx', 'appreciated']
+                
+                if any(word in text_lower for word in greeting_words):
+                    response_text = get_random_response(GREETINGS)
+                elif any(word in text_lower for word in farewell_words):
+                    response_text = get_random_response(FAREWELLS)
+                elif any(word in text_lower for word in thanks_words):
+                    response_text = get_random_response(THANKS_RESPONSES)
+                else:
+                    # Default to treating as a question if no clear intent
+                    if not rag_chain:
+                        response_text = "I'm sorry, but my knowledge base is currently unavailable. Please try again later."
+                        app.logger.error("RAG chain not available for fallback query.")
+                    else:
+                        app.logger.info(f"Treating as knowledge query (fallback): '{text}'")
+                        result = rag_chain.invoke({"query": text})
+                        
+                        if result.get("result"):
+                            response_text = result["result"]
+                        else:
+                            response_text = "I'm not quite sure how to handle that. I can answer questions about our documents or have a simple chat. How can I help?"
+
+        except Exception as e:
+            app.logger.error(f"Error during intent classification or RAG chain invocation: {e}", exc_info=True)
+            response_text = "Sorry, I encountered an error while trying to understand your request. Please try again!"
 
     # --- Send Response to Slack ---
     try:
@@ -373,23 +381,14 @@ def handle_message(event):
     except SlackApiError as e:
         app.logger.error(f"Error sending Slack message: {e.response['error']}")
 
-# --- Flask Routes ---
-
 @app.route("/slack/events", methods=["POST"])
 def slack_events_route():
     data = request.json
     
-    # Crucial: Immediately acknowledge the Slack request to prevent retries.
-    # The actual processing will happen in a separate thread/background task.
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data["challenge"]})
-    
-    # Process event in a non-blocking way
     if data.get("type") == "event_callback":
         event = data.get("event", {})
-        
-        # FIXED: Only process app_mention events OR direct messages to avoid duplicate responses
-        # Skip bot messages and only handle one event type per message
         if not event.get("bot_id") and event.get("user") != SLACK_BOT_USER_ID:
             # Handle app mentions (when bot is @mentioned)
             if event.get("type") == "app_mention":
@@ -400,8 +399,7 @@ def slack_events_route():
                 thread = threading.Thread(target=handle_message, args=(event,))
                 thread.start()
             
-    return jsonify({"status": "ok"}) # Acknowledge receipt immediately
-
+    return jsonify({"status": "ok"}) 
 
 @app.route("/add_knowledge", methods=["POST"])
 def add_knowledge_route():
@@ -509,6 +507,7 @@ def health_check_route():
             "llm_model": {"status": "ok" if llm else "error", "model_name": getattr(llm, 'model_name', 'N/A')},
             "embedding_model": {"status": "ok" if embeddings else "error", "model_name": getattr(embeddings, 'model_name', 'N/A')},
             "vector_store": {"status": "ok" if kb and kb.vectorstore else "error", **db_stats},
+            "intent_classifier_chain": {"status": "ok" if intent_classifier_chain else "error"},
             "rag_chain": {"status": "ok" if rag_chain else "error"},
             "slack_token": {"status": "ok" if SLACK_BOT_TOKEN else "error"},
         }

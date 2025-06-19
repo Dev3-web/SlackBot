@@ -37,7 +37,7 @@ st.markdown("""
 
 # --- API Configuration & State Management ---
 if 'api_url' not in st.session_state:
-    st.session_state.api_url = "http://localhost:3000"  # Default API URL
+    st.session_state.api_url = "https://slackbot-4.onrender.com"  # Default API URL # health check endpoint
 
 # --- API Helper Function ---
 def api_request(endpoint: str, method: str = "GET", data: dict = None, files: dict = None):

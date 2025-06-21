@@ -480,6 +480,81 @@ def test_search_route():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/question-gen", methods=["POST"])
+def question_gen_route():
+    if not rag_chain or not hasattr(rag_chain, 'llm') or not hasattr(rag_chain, 'retriever'):
+        app.logger.error("RAG chain, LLM, or retriever not initialized for /question-gen.")
+        return jsonify({"error": "RAG chain or its components not properly initialized."}), 503
+
+    data = request.json
+    if not data or not data.get("text"):
+        app.logger.warning("/question-gen called with missing 'text' in request body.")
+        return jsonify({"error": "Missing 'text' in request body."}), 400
+
+    input_text = data["text"]
+    app.logger.info(f"/question-gen received input text: '{input_text[:100]}...'")
+
+    try:
+        app.logger.info(f"Retrieving relevant documents for: '{input_text[:100]}...'")
+        retrieved_docs = rag_chain.retriever.get_relevant_documents(input_text)
+        app.logger.info(f"Retrieved {len(retrieved_docs)} documents.")
+
+        retrieved_context = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs])
+
+        prompt_for_llm = f"""You are an expert assistant designed to generate insightful questions.
+            Based on the Original Input Text and the Retrieved Context from a knowledge base below, generate exactly 3 distinct questions.
+            These questions should help explore the topics further or clarify ambiguities found in the provided texts.
+            Output ONLY the questions, each on a new line. Do not include any preamble, numbering, or extraneous text.
+
+            Original Input Text:
+
+            {input_text}
+
+
+            Retrieved Context from Knowledge Base:
+
+
+            Generated Questions (each on a new line):
+        """
+        app.logger.info("Invoking LLM to generate questions.")
+        llm_response = rag_chain.llm.invoke(prompt_for_llm)
+        
+        generated_questions_raw = ""
+        if hasattr(llm_response, 'content'): 
+            generated_questions_raw = llm_response.content
+        elif isinstance(llm_response, str): 
+            generated_questions_raw = llm_response
+        else:
+            app.logger.warning(f"Unexpected LLM response type: {type(llm_response)}")
+        
+        app.logger.info(f"Raw LLM output for questions: '{generated_questions_raw}'")
+
+        
+        questions_list = [q.strip() for q in generated_questions_raw.split('\n') if q.strip()]
+        
+        
+        if not questions_list and generated_questions_raw.strip():
+            questions_list = [generated_questions_raw.strip()]
+            app.logger.info("Parsed questions list was empty, using raw output as a single question.")
+        
+        app.logger.info(f"Successfully generated {len(questions_list)} questions.")
+
+        full_combined_context_for_debug = f"Input Text:\n{input_text}\n\nRetrieved Context:\n{retrieved_context}"
+
+
+        return jsonify({
+            "input_text": input_text,
+            "retrieved_context_preview": (retrieved_context[:300] + "...") if retrieved_context else "N/A",
+            "combined_context_preview_for_prompting_structure": (full_combined_context_for_debug[:500] + "...") if full_combined_context_for_debug else "N/A",
+            "generated_questions": questions_list,
+            "source_documents": [{"text": doc.page_content, "metadata": doc.metadata} for doc in retrieved_docs]
+        })
+
+    except Exception as e:
+        app.logger.error(f"Error in /question-gen for input '{input_text[:50]}...': {e}", exc_info=True)
+        return jsonify({"error": f"An internal server error occurred while generating questions: {str(e)}"}), 500
+
+
 @app.route("/test_rag_gen", methods=["POST"])
 def test_rag_gen_route():
     if not rag_chain: return jsonify({"error": "RAG chain not initialized."}), 503
